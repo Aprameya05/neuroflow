@@ -1,28 +1,34 @@
 """
 Real-time cognitive load inference.
-Runs the ONNX-exported LSTM model on a sliding window of behavioral signals.
 
-Before the model is trained, falls back to a heuristic stub so the rest
-of the system can be developed and tested end-to-end.
+Two modes:
+  1. ONNX model (production) -- loads when cognitive_load_lstm.onnx exists
+  2. Heuristic stub (development) -- used before model is trained
+
+The model expects a sequence of SEQ_LEN=30 feature windows, each 9-dimensional.
+The scaler stats (mean/std) from training are used for normalization.
 """
 import numpy as np
 from dataclasses import dataclass
 from collections import deque
 from typing import Optional
+from pathlib import Path
 from app.core.config import settings
 
 
 FEATURE_NAMES = [
-    "keystroke_iki_ms",       # Average inter-keystroke interval (ms)
-    "mouse_velocity",         # Average mouse speed (px/ms)
-    "mouse_acceleration",     # Std-dev of mouse speed (jerkiness)
-    "mouse_direction_changes",# Count of direction reversals per window
-    "scroll_velocity",        # Average scroll speed (px/ms)
-    "error_rate",             # Backspaces / total keypresses
-    "tab_switches",           # Tab/window switches per window
-    "pause_duration_ms",      # Longest continuous pause in window
-    "copy_paste_count",       # Copy + paste events per window
+    "keystroke_iki_ms",
+    "mouse_velocity",
+    "mouse_acceleration",
+    "mouse_direction_changes",
+    "scroll_velocity",
+    "error_rate",
+    "tab_switches",
+    "pause_duration_ms",
+    "copy_paste_count",
 ]
+
+SEQ_LEN = 30   # must match training config
 
 
 @dataclass
@@ -41,97 +47,126 @@ class BehavioralSignal:
 
 @dataclass
 class CognitiveLoadEstimate:
-    load_score: float       # 0.0 = low load (in flow) | 1.0 = high load (overwhelmed)
-    confidence: float       # model confidence [0, 1]
-    dominant_signal: str    # feature name that most influenced this estimate
+    load_score: float
+    confidence: float
+    dominant_signal: str
     window_size_ms: int
+    model_type: str   # "onnx" | "heuristic"
 
 
 class CognitiveLoadInferencer:
-    """
-    Per-session inferencer. One instance per WebSocket connection.
-
-    Usage:
-        inferencer = CognitiveLoadInferencer()
-        estimate = inferencer.push_signal(signal)  # returns None until enough history
-    """
-
     def __init__(self):
-        self._load_model()
-        self.window: deque[BehavioralSignal] = deque()
+        self.session_window: deque[BehavioralSignal] = deque()
+        self.feature_history: deque[np.ndarray] = deque(maxlen=SEQ_LEN)
         self.window_ms = settings.SIGNAL_WINDOW_MS
-        # Per-user z-score normalization — updated by calibration endpoint
-        self.feature_means = np.zeros(len(FEATURE_NAMES), dtype=np.float32)
-        self.feature_stds = np.ones(len(FEATURE_NAMES), dtype=np.float32)
+
+        # Load scaler stats if available
+        model_dir = Path(settings.MODEL_PATH).parent
+        mean_path = model_dir / "scaler_mean.npy"
+        std_path = model_dir / "scaler_std.npy"
+
+        if mean_path.exists() and std_path.exists():
+            self.feature_means = np.load(mean_path)
+            self.feature_stds = np.load(std_path)
+        else:
+            self.feature_means = np.zeros(len(FEATURE_NAMES), dtype=np.float32)
+            self.feature_stds = np.ones(len(FEATURE_NAMES), dtype=np.float32)
+
+        # Load ONNX model if available
+        self.session = None
+        self.model_type = "heuristic"
+        self._load_model()
 
     def _load_model(self):
+        model_path = Path(settings.MODEL_PATH)
+        if not model_path.exists():
+            print(f"[NeuroFlow] No ONNX model at {model_path} -- using heuristic stub")
+            return
         try:
             import onnxruntime as ort
-            self.session = ort.InferenceSession(settings.MODEL_PATH)
-        except Exception:
-            self.session = None  # Heuristic stub until model trained
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = 2
+            self.session = ort.InferenceSession(
+                str(model_path),
+                sess_options=opts,
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+            )
+            self.model_type = "onnx"
+            print(f"[NeuroFlow] ONNX model loaded from {model_path}")
+        except Exception as e:
+            print(f"[NeuroFlow] Failed to load ONNX model: {e} -- using heuristic stub")
 
     def push_signal(self, signal: BehavioralSignal) -> Optional[CognitiveLoadEstimate]:
-        self.window.append(signal)
-        cutoff = signal.timestamp_ms - self.window_ms
-        while self.window and self.window[0].timestamp_ms < cutoff:
-            self.window.popleft()
+        self.session_window.append(signal)
 
-        if len(self.window) < 5:
-            return None  # Need minimum signal history
+        # Drop signals outside sliding window
+        cutoff = signal.timestamp_ms - self.window_ms
+        while self.session_window and self.session_window[0].timestamp_ms < cutoff:
+            self.session_window.popleft()
+
+        if len(self.session_window) < 5:
+            return None
 
         features = self._extract_features()
-        return self._run_inference(features)
+        normalized = (features - self.feature_means) / (self.feature_stds + 1e-8)
+        self.feature_history.append(normalized)
+
+        return self._run_inference(features, normalized)
 
     def _extract_features(self) -> np.ndarray:
-        signals = list(self.window)
+        signals = list(self.session_window)
         ikis = [s.keystroke_iki_ms for s in signals if s.keystroke_iki_ms]
-        agg = {
-            "keystroke_iki_ms": float(np.nanmean(ikis)) if ikis else 300.0,
-            "mouse_velocity": float(np.mean([s.mouse_velocity for s in signals])),
-            "mouse_acceleration": float(np.std([s.mouse_velocity for s in signals])),
-            "mouse_direction_changes": float(sum(s.mouse_direction_changes for s in signals)),
-            "scroll_velocity": float(np.mean([s.scroll_velocity for s in signals])),
-            "error_rate": float(np.mean([s.error_rate for s in signals])),
-            "tab_switches": float(sum(s.tab_switches for s in signals)),
-            "pause_duration_ms": float(max(s.pause_duration_ms for s in signals)),
-            "copy_paste_count": float(sum(s.copy_paste_count for s in signals)),
-        }
-        raw = np.array([agg[f] for f in FEATURE_NAMES], dtype=np.float32)
-        return (raw - self.feature_means) / (self.feature_stds + 1e-8)
+        return np.array([
+            float(np.nanmean(ikis)) if ikis else 300.0,
+            float(np.mean([s.mouse_velocity for s in signals])),
+            float(np.std([s.mouse_velocity for s in signals])),
+            float(sum(s.mouse_direction_changes for s in signals)),
+            float(np.mean([s.scroll_velocity for s in signals])),
+            float(np.mean([s.error_rate for s in signals])),
+            float(sum(s.tab_switches for s in signals)),
+            float(max(s.pause_duration_ms for s in signals)),
+            float(sum(s.copy_paste_count for s in signals)),
+        ], dtype=np.float32)
 
-    def _run_inference(self, features: np.ndarray) -> CognitiveLoadEstimate:
-        dominant_idx = int(np.argmax(np.abs(features)))
+    def _run_inference(
+        self, raw_features: np.ndarray, normalized: np.ndarray
+    ) -> CognitiveLoadEstimate:
+        dominant_idx = int(np.argmax(np.abs(normalized)))
 
-        if self.session is None:
-            # Heuristic stub: high error rate + long pauses = high load
-            raw = features * self.feature_stds + self.feature_means
+        if self.session is None or len(self.feature_history) < SEQ_LEN:
+            # Heuristic: weighted combination of most predictive signals
             load = float(np.clip(
-                (raw[5] * 3.0) + (raw[7] / 10000.0) + (raw[6] * 0.1), 0, 1
+                0.3 * min(raw_features[5] * 4, 1.0)      # error_rate
+                + 0.25 * min(raw_features[7] / 8000, 1.0) # pause_duration
+                + 0.2 * min(raw_features[6] * 0.3, 1.0)   # tab_switches
+                + 0.15 * min(raw_features[2] * 2, 1.0)    # mouse_acceleration
+                + 0.1 * np.random.normal(0, 0.02),         # small noise
+                0.0, 1.0
             ))
             return CognitiveLoadEstimate(
                 load_score=round(load, 3),
                 confidence=0.4,
                 dominant_signal=FEATURE_NAMES[dominant_idx],
                 window_size_ms=self.window_ms,
+                model_type="heuristic",
             )
 
+        # ONNX inference
+        sequence = np.array(list(self.feature_history), dtype=np.float32)
+        sequence = sequence.reshape(1, SEQ_LEN, len(FEATURE_NAMES))
+
         input_name = self.session.get_inputs()[0].name
-        output = self.session.run(None, {input_name: features.reshape(1, 1, -1)})
-        load_score = float(np.clip(output[0][0][0], 0.0, 1.0))
-        confidence = float(output[1][0][0]) if len(output) > 1 else 0.85
+        outputs = self.session.run(None, {input_name: sequence})
+        load_score = float(np.clip(outputs[0][0], 0.0, 1.0))
 
         return CognitiveLoadEstimate(
             load_score=round(load_score, 3),
-            confidence=round(confidence, 3),
+            confidence=0.85,
             dominant_signal=FEATURE_NAMES[dominant_idx],
             window_size_ms=self.window_ms,
+            model_type="onnx",
         )
 
     def update_calibration(self, means: np.ndarray, stds: np.ndarray):
-        """
-        Update per-user feature normalization after a calibration session.
-        Called by the calibration API endpoint.
-        """
         self.feature_means = means.astype(np.float32)
         self.feature_stds = stds.astype(np.float32)
