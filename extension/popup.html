@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { width: 280px; font-family: system-ui, sans-serif; background: #fff; color: #111; }
+    .header { padding: 14px 16px; border-bottom: 1px solid #f3f4f6; display: flex; align-items: center; gap: 10px; }
+    .logo { width: 28px; height: 28px; border-radius: 8px; background: #6366f1; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
+    .title { font-weight: 600; font-size: 14px; }
+    .subtitle { font-size: 11px; color: #9ca3af; }
+    .body { padding: 16px; }
+    .gauge-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+    .load-number { font-size: 42px; font-weight: 700; line-height: 1; }
+    .state-badge { font-size: 11px; font-weight: 500; padding: 4px 10px; border-radius: 99px; }
+    .signal-row { display: flex; justify-content: space-between; font-size: 12px; color: #6b7280; padding: 5px 0; border-bottom: 1px solid #f9fafb; }
+    .signal-row span:last-child { color: #111; font-weight: 500; }
+    .status-row { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #9ca3af; margin-top: 14px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">N</div>
+    <div>
+      <div class="title">NeuroFlow</div>
+      <div class="subtitle">Cognitive Load Monitor</div>
+    </div>
+  </div>
+  <div class="body">
+    <div class="gauge-row">
+      <div class="load-number" id="load-number">—</div>
+      <div class="state-badge" id="state-badge">Waiting…</div>
+    </div>
+    <div id="signals"></div>
+    <div class="status-row">
+      <div class="dot" id="status-dot" style="background:#9ca3af"></div>
+      <span id="status-text">Connecting…</span>
+    </div>
+  </div>
+  <script src="src/popup.js"></script>
+</body>
+</html>

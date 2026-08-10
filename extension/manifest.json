@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "NeuroFlow",
+  "version": "0.1.0",
+  "description": "Real-time cognitive load inference from behavioral signals",
+  "permissions": ["storage", "tabs", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["src/collector.js"],
+    "run_at": "document_idle"
+  }],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "NeuroFlow"
+  }
+}
