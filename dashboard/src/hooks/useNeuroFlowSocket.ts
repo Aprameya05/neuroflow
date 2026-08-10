@@ -1,14 +1,11 @@
 /**
  * React hook — connects to the NeuroFlow WebSocket and streams load estimates.
- *
- * Usage:
- *   const { estimates, currentLoad, isConnected } = useNeuroFlowSocket(sessionId);
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { LoadEstimate } from "../types";
 
-const WS_URL = (import.meta as any).env?.VITE_WS_URL ?? "ws://localhost:8000/ws/signal";
-const MAX_HISTORY = 300; // ~30 seconds at 100ms sample rate
+const WS_URL = "wss://neuroflow-backend-r6rs.onrender.com/ws/signal";
+const MAX_HISTORY = 300;
 
 interface UseNeuroFlowSocketResult {
   estimates: LoadEstimate[];

@@ -1,4 +1,4 @@
-const WS_URL = "ws://localhost:8000/ws/signal";
+const WS_URL = "wss://neuroflow-backend-r6rs.onrender.com/ws/signal";
 let ws = null;
 let sessionId = null;
 let reconnectTimer = null;
