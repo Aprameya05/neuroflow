@@ -1,0 +1,15 @@
+{
+  "name": "@neuroflow/sdk",
+  "version": "0.1.0",
+  "description": "Adaptive cognitive load interface SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.3"
+  }
+}

@@ -1,0 +1,28 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: neuroflow
+      POSTGRES_PASSWORD: neuroflow
+      POSTGRES_DB: neuroflow
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  backend:
+    build:
+      context: ../../backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://neuroflow:neuroflow@postgres/neuroflow
+      REDIS_URL: redis://redis:6379
+    depends_on: [postgres, redis]
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+volumes:
+  pg_data:
