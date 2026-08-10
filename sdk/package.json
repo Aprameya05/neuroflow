@@ -9,7 +9,11 @@
     "build": "tsc",
     "dev": "tsc --watch"
   },
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
   "devDependencies": {
+    "@types/react": "^18.3.3",
     "typescript": "^5.5.3"
   }
 }
