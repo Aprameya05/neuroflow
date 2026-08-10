@@ -3,6 +3,8 @@ import { useNeuroFlowSocket } from "./hooks/useNeuroFlowSocket";
 import { LoadGauge } from "./components/LoadGauge";
 import { LoadTimeline } from "./components/LoadTimeline";
 import { SignalBreakdown } from "./components/SignalBreakdown";
+import { EstimateLog } from "./components/EstimateLog";
+import type { LoadEstimate } from "./types";
 
 const DEV_SESSION_ID = "dev-session-001";
 
@@ -24,9 +26,57 @@ function StatCard({ label, value }: { label: string; value: string }) {
   );
 }
 
+function UIStateBadge({ load }: { load: number | null }) {
+  if (load === null) return null;
+
+  const state =
+    load < 0.21 ? "rich" :
+    load < 0.30 ? "normal" :
+    load < 0.65 ? "reduced" : "minimal";
+
+  const styles = {
+    rich:    { bg: "#dcfce7", text: "#15803d", label: "Rich UI -- all features visible" },
+    normal:  { bg: "#eff6ff", text: "#1d4ed8", label: "Normal UI" },
+    reduced: { bg: "#fef9c3", text: "#854d0e", label: "Reduced UI -- simplifying interface" },
+    minimal: { bg: "#fef2f2", text: "#b91c1c", label: "Minimal UI -- focus mode active" },
+  };
+
+  const s = styles[state];
+
+  return (
+    <div style={{
+      background: s.bg,
+      color: s.text,
+      padding: "10px 16px",
+      borderRadius: 8,
+      fontSize: 13,
+      fontWeight: 500,
+      marginTop: 16
+    }}>
+      Current state: <strong>{state}</strong> -- {s.label}
+    </div>
+  );
+}
+
 export default function App() {
   const [sessionId] = useState(DEV_SESSION_ID);
   const { estimates, currentLoad, isConnected } = useNeuroFlowSocket(sessionId);
+  function exportCSV(estimates: LoadEstimate[]) {
+  const header = "timestamp,load,confidence,dominant\n";
+  const rows = estimates.map(e =>
+    `${new Date(e.ts).toISOString()},${e.load},${e.confidence},${e.dominant}`
+  ).join("\n");
+
+  const blob = new Blob([header + rows], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "neuroflow-session.csv";
+  a.click();
+
+  URL.revokeObjectURL(url);
+}
 
   const avg = estimates.length > 0 ? estimates.reduce((s,e)=>s+e.load,0)/estimates.length : null;
   const peak = estimates.length > 0 ? Math.max(...estimates.map(e=>e.load)) : null;
@@ -41,6 +91,23 @@ export default function App() {
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:12 }}>
           <code style={{ fontSize:11, color:"#6b7280" }}>{sessionId}</code>
+
+          <button
+            onClick={() => exportCSV(estimates)}
+            disabled={estimates.length === 0}
+            style={{
+              fontSize: 12,
+              padding: "6px 14px",
+              borderRadius: 6,
+              border: "1px solid #e5e7eb",
+              background: "#fff",
+              cursor: "pointer",
+              opacity: estimates.length === 0 ? 0.4 : 1
+            }}
+          >
+            Export CSV
+          </button>
+          
           <StatusPill on={isConnected} />
         </div>
       </header>
@@ -56,6 +123,7 @@ export default function App() {
             <StatCard label="Session avg" value={avg !== null ? `${Math.round(avg*100)}%` : "—"} />
             <StatCard label="Peak load" value={peak !== null ? `${Math.round(peak*100)}%` : "—"} />
           </div>
+          <UIStateBadge load={currentLoad} />
         </div>
 
         <div style={{ display:"grid", gridTemplateColumns:"1fr 280px", gap:18 }}>
@@ -71,6 +139,10 @@ export default function App() {
               ? <p style={{ fontSize:13, color:"#9ca3af" }}>Collecting…</p>
               : <SignalBreakdown estimates={estimates} />}
           </div>
+        </div>
+
+        <div style={{ marginTop: 18 }}>
+          <EstimateLog estimates={estimates} />
         </div>
 
         {!isConnected && (
