@@ -301,4 +301,4 @@ Open http://localhost:5173
 
 Aprameya -- github.com/Aprameya05
 
-Aashritha -- [add your GitHub]
+Aashritha -- github.com/aashrithateegavarapu
