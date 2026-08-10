@@ -1,25 +1,15 @@
 /**
- * AdaptiveEditor -- the core demo component.
- *
- * A CodeMirror editor that adapts based on cognitive load:
- *
- * rich     (< 21%)  -- full feature set: file tree, minimap, all panels visible
- * normal   (< 35%)  -- standard editor with sidebar
- * reduced  (< 65%)  -- sidebar collapsed, fewer distractions, larger font
- * minimal  (> 65%)  -- pure editor, everything else hidden, focus mode
- *
- * Each adaptation is grounded in cognitive load research:
- * - Reduced information density under high load (Sweller, 1988)
- * - Larger text reduces perceptual load (Paas & van Merrienboer, 1994)
- * - Suppressing irrelevant stimuli improves task performance (Lavie, 2005)
+ * AdaptiveEditor -- core adaptive CodeMirror editor component.
+ * Grounded in cognitive load theory (Sweller 1988, Paas & van Merrienboer 1994, Lavie 2005).
  */
 import CodeMirror from "@uiw/react-codemirror";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { autocompletion } from "@codemirror/autocomplete";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import type { UIState } from "../hooks/useNeuroFlow";
+import { getLoadColor, getLoadColorRgba } from "../utils/theme";
 
 interface AdaptiveEditorProps {
   uiState: UIState;
@@ -74,7 +64,7 @@ print(f"First 10 Fibonacci numbers: {result}")
 print(f"Primes under 100: {primes}")
 `;
 
-// Adaptation values derived from cognitive load score
+// Adaptation values derived from cognitive load score -- UNCHANGED logic & thresholds
 function getAdaptations(uiState: UIState, score: number) {
   const adaptations = {
     rich: {
@@ -87,9 +77,9 @@ function getAdaptations(uiState: UIState, score: number) {
       showStatusBar: true,
       showFileTree: true,
       autocompleteDelay: 200,
-      padding: "12px 16px",
+      padding: "16px 20px",
       opacity: 1,
-      animationDuration: "0.15s",
+      animationDuration: "0.4s",
       showProblems: true,
     },
     normal: {
@@ -102,9 +92,9 @@ function getAdaptations(uiState: UIState, score: number) {
       showStatusBar: true,
       showFileTree: true,
       autocompleteDelay: 300,
-      padding: "12px 16px",
+      padding: "16px 20px",
       opacity: 1,
-      animationDuration: "0.2s",
+      animationDuration: "0.4s",
       showProblems: true,
     },
     reduced: {
@@ -117,9 +107,9 @@ function getAdaptations(uiState: UIState, score: number) {
       showStatusBar: false,
       showFileTree: false,
       autocompleteDelay: 100,  // more aggressive: help the user
-      padding: "16px 24px",
-      opacity: 0.95,
-      animationDuration: "0.3s",
+      padding: "20px 28px",
+      opacity: 0.96,
+      animationDuration: "0.5s",
       showProblems: false,     // hide distracting error markers
     },
     minimal: {
@@ -132,9 +122,9 @@ function getAdaptations(uiState: UIState, score: number) {
       showStatusBar: false,
       showFileTree: false,
       autocompleteDelay: 50,   // maximum assistance
-      padding: "24px 32px",
-      opacity: 0.9,
-      animationDuration: "0.4s",
+      padding: "28px 40px",
+      opacity: 0.92,
+      animationDuration: "0.6s",
       showProblems: false,
     },
   };
@@ -154,121 +144,263 @@ export function AdaptiveEditor({ uiState, score, onCodeChange }: AdaptiveEditorP
   const adapt = getAdaptations(uiState, score);
 
   const pct = Math.round(score * 100);
-  const loadColor = score < 0.35 ? "#22c55e" : score < 0.65 ? "#f59e0b" : "#ef4444";
+  const loadColor = getLoadColor(score);
+  const loadGlowLow = getLoadColorRgba(score, 0.12);
+  const loadGlowHigh = getLoadColorRgba(score, 0.35);
 
   return (
     <div style={{
       display: "flex",
       flexDirection: "column",
       height: "100%",
-      background: "#0f1117",
-      transition: `all ${adapt.animationDuration} ease`,
+      width: "100%",
+      background: "#0a0d14",
+      position: "relative",
+      overflow: "hidden",
+      transition: `background ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
     }}>
-      {/* Tab bar */}
+      {/* File Tab bar */}
       <div style={{
         display: "flex",
         alignItems: "center",
-        background: "#161b22",
-        borderBottom: "1px solid #21262d",
+        background: "rgba(12, 16, 26, 0.9)",
+        backdropFilter: "blur(10px)",
+        borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
         padding: "0 8px",
-        gap: 2,
+        height: 38,
         flexShrink: 0,
+        position: "relative",
+        zIndex: 5,
         transition: `all ${adapt.animationDuration} ease`,
       }}>
-        {FILES.map(file => (
-          <button
-            key={file.name}
-            onClick={() => setActiveFile(file.name)}
-            style={{
-              padding: "8px 16px",
-              background: activeFile === file.name ? "#0f1117" : "transparent",
-              color: activeFile === file.name ? "#e2e8f0" : "#8b949e",
-              border: "none",
-              borderTop: activeFile === file.name ? `2px solid ${loadColor}` : "2px solid transparent",
-              cursor: "pointer",
-              fontSize: 12,
-              fontFamily: "monospace",
-              transition: "all 0.2s",
-            }}
-          >
-            {file.name}
-          </button>
-        ))}
-
-        {/* Load indicator in tab bar */}
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, paddingRight: 8 }}>
-          <div style={{
-            width: 60, height: 4, background: "#21262d", borderRadius: 2,
-          }}>
-            <div style={{
-              width: `${pct}%`, height: "100%",
-              background: loadColor, borderRadius: 2,
-              transition: "width 0.5s ease, background 0.5s ease",
-            }} />
-          </div>
-          <span style={{ fontSize: 11, color: "#8b949e", fontFamily: "monospace" }}>
-            {pct}%
-          </span>
-        </div>
-      </div>
-
-      {/* Main area */}
-      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
-        {/* File tree sidebar */}
-        {adapt.showSidebar && (
-          <div style={{
-            width: adapt.sidebarWidth,
-            background: "#161b22",
-            borderRight: "1px solid #21262d",
-            padding: "8px 0",
-            flexShrink: 0,
-            overflow: "hidden",
-            transition: `width ${adapt.animationDuration} ease`,
-          }}>
-            <div style={{ padding: "4px 12px 8px", fontSize: 10, color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em" }}>
-              Explorer
-            </div>
-            {FILES.map(file => (
-              <div
+        <div style={{ display: "flex", alignItems: "center", height: "100%", gap: 2 }}>
+          {FILES.map(file => {
+            const isActive = activeFile === file.name;
+            return (
+              <button
                 key={file.name}
                 onClick={() => setActiveFile(file.name)}
                 style={{
-                  padding: "5px 16px",
-                  fontSize: 13,
-                  color: activeFile === file.name ? "#e2e8f0" : "#8b949e",
-                  background: activeFile === file.name ? "#1f2937" : "transparent",
+                  height: "100%",
+                  padding: "0 16px",
+                  background: isActive ? "#0a0d14" : "transparent",
+                  color: isActive ? "#f8fafc" : "#64748b",
+                  border: "none",
+                  borderBottom: isActive ? `2px solid ${loadColor}` : "2px solid transparent",
+                  boxShadow: isActive ? `inset 0 -8px 12px ${loadGlowLow}` : "none",
                   cursor: "pointer",
-                  fontFamily: "monospace",
+                  fontSize: 12,
+                  fontFamily: "'JetBrains Mono', monospace",
+                  fontWeight: isActive ? 600 : 400,
                   display: "flex",
                   alignItems: "center",
-                  gap: 6,
+                  gap: 8,
+                  transition: "all 0.25s cubic-bezier(0.16, 1, 0.3, 1)",
+                  position: "relative",
                 }}
               >
-                <span style={{ fontSize: 11 }}>
+                <span style={{
+                  fontSize: 12,
+                  opacity: isActive ? 1 : 0.6,
+                }}>
                   {file.lang === "python" ? "🐍" : "⚡"}
                 </span>
-                {file.name}
-              </div>
-            ))}
+                <span>{file.name}</span>
+                {isActive && (
+                  <div style={{
+                    position: "absolute",
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    height: 2,
+                    background: loadColor,
+                    boxShadow: `0 0 10px ${loadColor}`,
+                  }} />
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Load indicator progress bar bleeding across the top/bottom of tab bar */}
+        <div style={{
+          marginLeft: "auto",
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          paddingRight: 12,
+        }}>
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "3px 10px",
+            borderRadius: 14,
+            background: "rgba(255, 255, 255, 0.03)",
+            border: "1px solid rgba(255, 255, 255, 0.06)",
+          }}>
+            <div style={{
+              width: 90,
+              height: 5,
+              background: "rgba(255, 255, 255, 0.08)",
+              borderRadius: 3,
+              overflow: "hidden",
+              position: "relative",
+            }}>
+              <div style={{
+                width: `${pct}%`,
+                height: "100%",
+                background: `linear-gradient(90deg, #6366f1 0%, #f59e0b 50%, #ef4444 100%)`,
+                borderRadius: 3,
+                boxShadow: `0 0 10px ${loadColor}`,
+                transition: "width 0.4s cubic-bezier(0.16, 1, 0.3, 1)",
+              }} />
+            </div>
+            <span style={{
+              fontSize: 11,
+              fontWeight: 600,
+              color: loadColor,
+              fontFamily: "'JetBrains Mono', monospace",
+              minWidth: 32,
+              textAlign: "right",
+            }}>
+              {pct}%
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Main editor area */}
+      <div style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative" }}>
+        {/* Animated sliding File tree sidebar */}
+        <div style={{
+          width: adapt.showSidebar ? adapt.sidebarWidth : 0,
+          opacity: adapt.showSidebar ? 1 : 0,
+          transform: adapt.showSidebar ? "translateX(0)" : "translateX(-20px)",
+          background: "rgba(12, 16, 26, 0.85)",
+          borderRight: adapt.showSidebar ? "1px solid rgba(255, 255, 255, 0.06)" : "none",
+          flexShrink: 0,
+          overflow: "hidden",
+          display: "flex",
+          flexDirection: "column",
+          transition: `width ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1), opacity ${adapt.animationDuration} ease, transform ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
+          position: "relative",
+        }}>
+          {/* Cyber grid / particle background in Rich mode */}
+          {uiState === "rich" && (
+            <div style={{
+              position: "absolute",
+              inset: 0,
+              backgroundImage: `
+                radial-gradient(circle at 50% 30%, ${loadGlowHigh} 0%, transparent 65%),
+                linear-gradient(to bottom, rgba(99, 102, 241, 0.04) 1px, transparent 1px)
+              `,
+              backgroundSize: "100% 100%, 100% 16px",
+              pointerEvents: "none",
+              zIndex: 0,
+            }} />
+          )}
+
+          <div style={{ position: "relative", zIndex: 1, padding: "12px 0" }}>
+            <div style={{
+              padding: "4px 16px 8px",
+              fontSize: 10,
+              fontWeight: 700,
+              color: "#475569",
+              textTransform: "uppercase",
+              letterSpacing: "0.12em",
+            }}>
+              Explorer
+            </div>
+            {FILES.map(file => {
+              const isActive = activeFile === file.name;
+              return (
+                <div
+                  key={file.name}
+                  onClick={() => setActiveFile(file.name)}
+                  style={{
+                    padding: "7px 16px",
+                    fontSize: 13,
+                    color: isActive ? "#f8fafc" : "#94a3b8",
+                    background: isActive ? getLoadColorRgba(score, 0.12) : "transparent",
+                    borderLeft: isActive ? `3px solid ${loadColor}` : "3px solid transparent",
+                    cursor: "pointer",
+                    fontFamily: "'JetBrains Mono', monospace",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    transition: "all 0.2s ease",
+                  }}
+                >
+                  <span style={{ fontSize: 12 }}>
+                    {file.lang === "python" ? "🐍" : "⚡"}
+                  </span>
+                  <span>{file.name}</span>
+                </div>
+              );
+            })}
 
             {/* Git panel -- only visible in rich/normal mode */}
             {adapt.showFileTree && (
-              <div style={{ marginTop: 16 }}>
-                <div style={{ padding: "4px 12px 8px", fontSize: 10, color: "#8b949e", textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                  Source Control
+              <div style={{ marginTop: 24, borderTop: "1px solid rgba(255, 255, 255, 0.05)", paddingTop: 16 }}>
+                <div style={{
+                  padding: "4px 16px 8px",
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: "#475569",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.12em",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                }}>
+                  <span>Source Control</span>
+                  <span style={{
+                    fontSize: 9,
+                    padding: "1px 5px",
+                    borderRadius: 8,
+                    background: "rgba(99, 102, 241, 0.15)",
+                    color: "#6366f1",
+                  }}>main*</span>
                 </div>
-                {["M main.py", "? utils.py"].map(item => (
-                  <div key={item} style={{ padding: "4px 16px", fontSize: 12, color: "#8b949e", fontFamily: "monospace" }}>
-                    {item}
+                {[
+                  { file: "M main.py", color: "#f59e0b" },
+                  { file: "? utils.py", color: "#34d399" },
+                ].map(item => (
+                  <div
+                    key={item.file}
+                    style={{
+                      padding: "6px 16px",
+                      fontSize: 12,
+                      color: "#94a3b8",
+                      fontFamily: "'JetBrains Mono', monospace",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                    }}
+                  >
+                    <span style={{ color: item.color, fontWeight: 700, fontSize: 11 }}>
+                      {item.file.substring(0, 1)}
+                    </span>
+                    <span>{item.file.substring(2)}</span>
                   </div>
                 ))}
               </div>
             )}
           </div>
-        )}
+        </div>
 
-        {/* Editor */}
-        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        {/* CodeMirror Editor canvas container */}
+        <div style={{
+          flex: 1,
+          overflow: "hidden",
+          display: "flex",
+          flexDirection: "column",
+          padding: adapt.padding,
+          opacity: adapt.opacity,
+          transition: `all ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
+          background: "#0a0d14",
+        }}>
           <CodeMirror
             value={code}
             height="100%"
@@ -290,40 +422,57 @@ export function AdaptiveEditor({ uiState, score, onCodeChange }: AdaptiveEditorP
             }}
             style={{
               fontSize: adapt.fontSize,
+              lineHeight: adapt.lineHeight,
               flex: 1,
               height: "100%",
+              borderRadius: 8,
+              overflow: "hidden",
             }}
           />
         </div>
       </div>
 
-      {/* Status bar */}
-      {adapt.showStatusBar && (
-        <div style={{
-          background: "#161b22",
-          borderTop: "1px solid #21262d",
-          padding: "4px 16px",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          fontSize: 11,
-          color: "#8b949e",
-          flexShrink: 0,
-          transition: `opacity ${adapt.animationDuration} ease`,
-        }}>
-          <div style={{ display: "flex", gap: 16 }}>
-            <span>{activeFile}</span>
-            <span>Python 3.11</span>
-            <span>UTF-8</span>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <span style={{ color: loadColor }}>
-              NeuroFlow: {uiState} mode
-            </span>
-            <span>Ln 1, Col 1</span>
-          </div>
+      {/* Sleek status bar */}
+      <div style={{
+        height: adapt.showStatusBar ? 26 : 0,
+        opacity: adapt.showStatusBar ? 1 : 0,
+        background: "rgba(10, 13, 20, 0.95)",
+        borderTop: "1px solid rgba(255, 255, 255, 0.05)",
+        padding: "0 16px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        fontSize: 11,
+        color: "#64748b",
+        fontFamily: "'JetBrains Mono', monospace",
+        flexShrink: 0,
+        transition: `all ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
+        overflow: "hidden",
+      }}>
+        <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+          <span style={{ color: "#94a3b8" }}>{activeFile}</span>
+          <span style={{ color: "#475569" }}>•</span>
+          <span>Python 3.11</span>
+          <span style={{ color: "#475569" }}>•</span>
+          <span>UTF-8</span>
         </div>
-      )}
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <span style={{
+            color: loadColor,
+            fontWeight: 600,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+          }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: "50%",
+              background: loadColor, boxShadow: `0 0 8px ${loadColor}`,
+            }} />
+            NeuroFlow: {uiState} mode
+          </span>
+          <span>Ln 1, Col 1</span>
+        </div>
+      </div>
     </div>
   );
 }

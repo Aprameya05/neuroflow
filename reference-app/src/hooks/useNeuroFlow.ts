@@ -1,12 +1,19 @@
 /**
  * useNeuroFlow -- core hook for the adaptive editor.
- * Connects to backend, collects behavioral signals, returns live load state.
- * All UI adaptation in the app derives from this single hook.
+ *
+ * Key design decisions:
+ * - Warmup runs ONCE per page load, never resets on reconnect
+ * - EMA smoothing prevents score bouncing
+ * - UI state requires 2s stability before switching
+ * - Reconnects are transparent -- UI never flickers on disconnect
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 
 const WS_URL = "wss://neuroflow-backend-r6rs.onrender.com/ws/signal";
 const SAMPLE_RATE_MS = 100;
+const WARMUP_MS = 5000;       // 5s warmup, runs once only
+const EMA_ALPHA = 0.12;       // gentle smoothing
+const STATE_DEBOUNCE_MS = 2000; // 2s stability before UI state switches
 
 export type UIState = "rich" | "normal" | "reduced" | "minimal";
 
@@ -63,7 +70,10 @@ class SignalCollector {
     });
 
     document.addEventListener("copy", () => this.cpCount++);
-    document.addEventListener("paste", () => { this.cpCount++; this.lastActivity = Date.now(); });
+    document.addEventListener("paste", () => {
+      this.cpCount++;
+      this.lastActivity = Date.now();
+    });
 
     this.intervalId = setInterval(() => emit(this.flush()), SAMPLE_RATE_MS);
   }
@@ -108,7 +118,8 @@ class SignalCollector {
 
   private computeDC() {
     if (this.mouseTrack.length < 3) return 0;
-    let changes = 0; let prev: number | null = null;
+    let changes = 0;
+    let prev: number | null = null;
     for (let i = 1; i < this.mouseTrack.length; i++) {
       const dx = this.mouseTrack[i].x - this.mouseTrack[i - 1].x;
       const dy = this.mouseTrack[i].y - this.mouseTrack[i - 1].y;
@@ -129,13 +140,33 @@ function scoreToUIState(score: number): UIState {
 
 export function useNeuroFlow(sessionId: string): LoadState {
   const [state, setState] = useState<LoadState>({
-    score: 0.3, uiState: "normal", dominant: "—",
-    confidence: 0, modelType: "heuristic", isConnected: false, history: [],
+    score: 0.3,
+    uiState: "normal",
+    dominant: "—",
+    confidence: 0,
+    modelType: "heuristic",
+    isConnected: false,
+    history: [],
   });
 
   const wsRef = useRef<WebSocket | null>(null);
   const collectorRef = useRef<SignalCollector | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Warmup: runs ONCE per page load, never resets on reconnect
+  const warmupDone = useRef(false);
+  const warmupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const warmupStarted = useRef(false);
+
+  // Smoothing
+  const smoothedScore = useRef(0.3);
+
+  // UI state debounce
+  const pendingUIState = useRef<UIState>("normal");
+  const stateDebounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Signal collector is created once, reused across reconnects
+  const collectorStarted = useRef(false);
 
   const connect = useCallback(() => {
     const ws = new WebSocket(`${WS_URL}/${sessionId}`);
@@ -143,29 +174,59 @@ export function useNeuroFlow(sessionId: string): LoadState {
 
     ws.onopen = () => {
       setState(s => ({ ...s, isConnected: true }));
-      collectorRef.current = new SignalCollector();
-      collectorRef.current.start((signal) => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(signal));
-      });
+
+      // Start warmup only on the very first connection, never again
+      if (!warmupStarted.current) {
+        warmupStarted.current = true;
+        warmupTimer.current = setTimeout(() => {
+          warmupDone.current = true;
+        }, WARMUP_MS);
+      }
+
+      // Start signal collector only once
+      if (!collectorStarted.current) {
+        collectorStarted.current = true;
+        collectorRef.current = new SignalCollector();
+        collectorRef.current.start((signal) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(signal));
+        });
+      }
     };
 
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       if (msg.type !== "load_estimate") return;
+      if (!warmupDone.current) return;
+
+      // EMA smoothing
+      smoothedScore.current = EMA_ALPHA * msg.load + (1 - EMA_ALPHA) * smoothedScore.current;
+      const smoothed = Math.round(smoothedScore.current * 1000) / 1000;
+      const newUIState = scoreToUIState(smoothed);
+
+      // Debounce UI state -- only commit after 2s stability
+      if (newUIState !== pendingUIState.current) {
+        pendingUIState.current = newUIState;
+        if (stateDebounceTimer.current) clearTimeout(stateDebounceTimer.current);
+        stateDebounceTimer.current = setTimeout(() => {
+          setState(s => ({ ...s, uiState: newUIState }));
+        }, STATE_DEBOUNCE_MS);
+      }
+
+      // Score and history update immediately
       setState(s => ({
-        score: msg.load,
-        uiState: scoreToUIState(msg.load),
+        ...s,
+        score: smoothed,
         dominant: msg.dominant,
         confidence: msg.confidence,
         modelType: msg.model_type ?? "heuristic",
         isConnected: true,
-        history: [...s.history, msg.load].slice(-60),
+        history: [...s.history, smoothed].slice(-60),
       }));
     };
 
     ws.onclose = () => {
+      // Only show disconnected -- don't reset warmup or collector
       setState(s => ({ ...s, isConnected: false }));
-      collectorRef.current?.stop();
       reconnectTimer.current = setTimeout(connect, 3000);
     };
 
@@ -176,6 +237,8 @@ export function useNeuroFlow(sessionId: string): LoadState {
     connect();
     return () => {
       reconnectTimer.current && clearTimeout(reconnectTimer.current);
+      warmupTimer.current && clearTimeout(warmupTimer.current);
+      stateDebounceTimer.current && clearTimeout(stateDebounceTimer.current);
       collectorRef.current?.stop();
       wsRef.current?.close();
     };
