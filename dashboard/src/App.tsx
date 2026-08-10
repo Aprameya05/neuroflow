@@ -6,7 +6,15 @@ import { SignalBreakdown } from "./components/SignalBreakdown";
 import { EstimateLog } from "./components/EstimateLog";
 import type { LoadEstimate } from "./types";
 
-const DEV_SESSION_ID = "dev-session-001";
+// Generate a stable session ID per browser session
+// This means every visitor to the dashboard gets their own session
+const SESSION_ID = (() => {
+  const stored = sessionStorage.getItem("nf-dashboard-session");
+  if (stored) return stored;
+  const id = `dashboard-${crypto.randomUUID().slice(0, 8)}`;
+  sessionStorage.setItem("nf-dashboard-session", id);
+  return id;
+})();
 
 function StatusPill({ on }: { on: boolean }) {
   return (
@@ -28,55 +36,41 @@ function StatCard({ label, value }: { label: string; value: string }) {
 
 function UIStateBadge({ load }: { load: number | null }) {
   if (load === null) return null;
-
   const state =
     load < 0.21 ? "rich" :
     load < 0.30 ? "normal" :
     load < 0.65 ? "reduced" : "minimal";
-
   const styles = {
     rich:    { bg: "#dcfce7", text: "#15803d", label: "Rich UI -- all features visible" },
     normal:  { bg: "#eff6ff", text: "#1d4ed8", label: "Normal UI" },
     reduced: { bg: "#fef9c3", text: "#854d0e", label: "Reduced UI -- simplifying interface" },
     minimal: { bg: "#fef2f2", text: "#b91c1c", label: "Minimal UI -- focus mode active" },
   };
-
   const s = styles[state];
-
   return (
-    <div style={{
-      background: s.bg,
-      color: s.text,
-      padding: "10px 16px",
-      borderRadius: 8,
-      fontSize: 13,
-      fontWeight: 500,
-      marginTop: 16
-    }}>
+    <div style={{ background: s.bg, color: s.text, padding: "10px 16px", borderRadius: 8, fontSize: 13, fontWeight: 500, marginTop: 16 }}>
       Current state: <strong>{state}</strong> -- {s.label}
     </div>
   );
 }
 
-export default function App() {
-  const [sessionId] = useState(DEV_SESSION_ID);
-  const { estimates, currentLoad, isConnected } = useNeuroFlowSocket(sessionId);
-  function exportCSV(estimates: LoadEstimate[]) {
+function exportCSV(estimates: LoadEstimate[]) {
   const header = "timestamp,load,confidence,dominant\n";
   const rows = estimates.map(e =>
     `${new Date(e.ts).toISOString()},${e.load},${e.confidence},${e.dominant}`
   ).join("\n");
-
   const blob = new Blob([header + rows], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
-
   const a = document.createElement("a");
   a.href = url;
-  a.download = "neuroflow-session.csv";
+  a.download = `neuroflow-${SESSION_ID}.csv`;
   a.click();
-
   URL.revokeObjectURL(url);
 }
+
+export default function App() {
+  const [sessionId] = useState(SESSION_ID);
+  const { estimates, currentLoad, isConnected } = useNeuroFlowSocket(sessionId);
 
   const avg = estimates.length > 0 ? estimates.reduce((s,e)=>s+e.load,0)/estimates.length : null;
   const peak = estimates.length > 0 ? Math.max(...estimates.map(e=>e.load)) : null;
@@ -91,23 +85,13 @@ export default function App() {
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:12 }}>
           <code style={{ fontSize:11, color:"#6b7280" }}>{sessionId}</code>
-
           <button
             onClick={() => exportCSV(estimates)}
             disabled={estimates.length === 0}
-            style={{
-              fontSize: 12,
-              padding: "6px 14px",
-              borderRadius: 6,
-              border: "1px solid #e5e7eb",
-              background: "#fff",
-              cursor: "pointer",
-              opacity: estimates.length === 0 ? 0.4 : 1
-            }}
+            style={{ fontSize:12, padding:"6px 14px", borderRadius:6, border:"1px solid #e5e7eb", background:"#fff", cursor:"pointer", opacity: estimates.length === 0 ? 0.4 : 1 }}
           >
             Export CSV
           </button>
-          
           <StatusPill on={isConnected} />
         </div>
       </header>
@@ -147,7 +131,8 @@ export default function App() {
 
         {!isConnected && (
           <div style={{ marginTop:18, padding:"12px 16px", background:"#fef2f2", border:"1px solid #fecaca", borderRadius:8, fontSize:13, color:"#b91c1c" }}>
-            Not connected. Start the backend: <code>cd backend && uvicorn app.main:app --reload</code>
+            Not connected to backend. The Chrome extension must be installed and active for data to appear.
+            Install it from the <a href="https://github.com/Aprameya05/neuroflow" style={{ color:"#b91c1c" }}>GitHub repo</a> and open any webpage.
           </div>
         )}
       </main>
