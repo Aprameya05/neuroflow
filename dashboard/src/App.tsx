@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNeuroFlowSocket } from "./hooks/useNeuroFlowSocket";
 import { LoadGauge } from "./components/LoadGauge";
 import { LoadTimeline } from "./components/LoadTimeline";
@@ -6,8 +6,6 @@ import { SignalBreakdown } from "./components/SignalBreakdown";
 import { EstimateLog } from "./components/EstimateLog";
 import type { LoadEstimate } from "./types";
 
-// Generate a stable session ID per browser session
-// This means every visitor to the dashboard gets their own session
 const SESSION_ID = (() => {
   const stored = sessionStorage.getItem("nf-dashboard-session");
   if (stored) return stored;
@@ -16,7 +14,45 @@ const SESSION_ID = (() => {
   return id;
 })();
 
-function StatusPill({ on }: { on: boolean }) {
+const DOMINANT_SIGNALS = [
+  "pause_duration_ms", "error_rate", "mouse_velocity",
+  "keystroke_iki_ms", "tab_switches", "scroll_velocity",
+];
+
+// Generates realistic simulated load data for demo mode
+function generateDemoEstimates(count: number): LoadEstimate[] {
+  const estimates: LoadEstimate[] = [];
+  let load = 0.35;
+  const now = Date.now();
+
+  for (let i = count; i >= 0; i--) {
+    // Simulate realistic cognitive load pattern -- gradual changes with occasional spikes
+    const drift = (Math.random() - 0.48) * 0.06;
+    load = Math.max(0.05, Math.min(0.95, load + drift));
+    // Occasional load spikes (simulates a difficult task moment)
+    if (Math.random() < 0.03) load = Math.min(0.95, load + 0.25);
+    // Occasional recovery (simulates a break)
+    if (Math.random() < 0.02) load = Math.max(0.1, load - 0.2);
+
+    estimates.push({
+      type: "load_estimate",
+      load: Math.round(load * 1000) / 1000,
+      confidence: 0.4 + Math.random() * 0.3,
+      dominant: DOMINANT_SIGNALS[Math.floor(Math.random() * DOMINANT_SIGNALS.length)],
+      ts: now - i * 300,
+      session_id: "demo-session",
+    });
+  }
+  return estimates;
+}
+
+function StatusPill({ on, demo }: { on: boolean; demo: boolean }) {
+  if (demo) return (
+    <span style={{ display:"inline-flex", alignItems:"center", gap:6, fontSize:12, padding:"3px 10px", borderRadius:99, background:"#fef9c3", color:"#854d0e" }}>
+      <span style={{ width:7, height:7, borderRadius:"50%", background:"#f59e0b" }} />
+      Demo mode
+    </span>
+  );
   return (
     <span style={{ display:"inline-flex", alignItems:"center", gap:6, fontSize:12, padding:"3px 10px", borderRadius:99, background: on?"#dcfce7":"#fef2f2", color: on?"#15803d":"#b91c1c" }}>
       <span style={{ width:7, height:7, borderRadius:"50%", background: on?"#22c55e":"#ef4444" }} />
@@ -36,10 +72,7 @@ function StatCard({ label, value }: { label: string; value: string }) {
 
 function UIStateBadge({ load }: { load: number | null }) {
   if (load === null) return null;
-  const state =
-    load < 0.21 ? "rich" :
-    load < 0.30 ? "normal" :
-    load < 0.65 ? "reduced" : "minimal";
+  const state = load < 0.21 ? "rich" : load < 0.30 ? "normal" : load < 0.65 ? "reduced" : "minimal";
   const styles = {
     rich:    { bg: "#dcfce7", text: "#15803d", label: "Rich UI -- all features visible" },
     normal:  { bg: "#eff6ff", text: "#1d4ed8", label: "Normal UI" },
@@ -54,7 +87,7 @@ function UIStateBadge({ load }: { load: number | null }) {
   );
 }
 
-function exportCSV(estimates: LoadEstimate[]) {
+function exportCSV(estimates: LoadEstimate[], sessionId: string) {
   const header = "timestamp,load,confidence,dominant\n";
   const rows = estimates.map(e =>
     `${new Date(e.ts).toISOString()},${e.load},${e.confidence},${e.dominant}`
@@ -63,17 +96,74 @@ function exportCSV(estimates: LoadEstimate[]) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `neuroflow-${SESSION_ID}.csv`;
+  a.download = `neuroflow-${sessionId}.csv`;
   a.click();
   URL.revokeObjectURL(url);
 }
 
 export default function App() {
   const [sessionId] = useState(SESSION_ID);
-  const { estimates, currentLoad, isConnected } = useNeuroFlowSocket(sessionId);
+  const { estimates: liveEstimates, currentLoad: liveLoad, isConnected } = useNeuroFlowSocket(sessionId);
 
-  const avg = estimates.length > 0 ? estimates.reduce((s,e)=>s+e.load,0)/estimates.length : null;
-  const peak = estimates.length > 0 ? Math.max(...estimates.map(e=>e.load)) : null;
+  // Demo mode: active when not connected after 3 seconds
+  const [demoMode, setDemoMode] = useState(false);
+  const [demoEstimates, setDemoEstimates] = useState<LoadEstimate[]>([]);
+  const demoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const demoInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (isConnected) {
+      // Real connection -- kill demo mode
+      setDemoMode(false);
+      if (demoTimer.current) clearTimeout(demoTimer.current);
+      if (demoInterval.current) clearInterval(demoInterval.current);
+      return;
+    }
+
+    // Start demo mode after 3 seconds of no connection
+    demoTimer.current = setTimeout(() => {
+      setDemoMode(true);
+      setDemoEstimates(generateDemoEstimates(100));
+
+      // Keep adding new demo estimates every 300ms
+      demoInterval.current = setInterval(() => {
+        setDemoEstimates(prev => {
+          const last = prev[prev.length - 1];
+          const prevLoad = last?.load ?? 0.35;
+          const drift = (Math.random() - 0.48) * 0.06;
+          let newLoad = Math.max(0.05, Math.min(0.95, prevLoad + drift));
+          if (Math.random() < 0.03) newLoad = Math.min(0.95, newLoad + 0.25);
+          if (Math.random() < 0.02) newLoad = Math.max(0.1, newLoad - 0.2);
+          newLoad = Math.round(newLoad * 1000) / 1000;
+
+          const newEstimate: LoadEstimate = {
+            type: "load_estimate",
+            load: newLoad,
+            confidence: 0.4 + Math.random() * 0.3,
+            dominant: DOMINANT_SIGNALS[Math.floor(Math.random() * DOMINANT_SIGNALS.length)],
+            ts: Date.now(),
+            session_id: "demo-session",
+          };
+
+          const next = [...prev, newEstimate];
+          return next.length > 300 ? next.slice(-300) : next;
+        });
+      }, 300);
+    }, 3000);
+
+    return () => {
+      if (demoTimer.current) clearTimeout(demoTimer.current);
+      if (demoInterval.current) clearInterval(demoInterval.current);
+    };
+  }, [isConnected]);
+
+  const estimates = isConnected ? liveEstimates : demoEstimates;
+  const currentLoad = isConnected
+    ? liveLoad
+    : demoEstimates.length > 0 ? demoEstimates[demoEstimates.length - 1].load : null;
+
+  const avg = estimates.length > 0 ? estimates.reduce((s, e) => s + e.load, 0) / estimates.length : null;
+  const peak = estimates.length > 0 ? Math.max(...estimates.map(e => e.load)) : null;
 
   return (
     <div style={{ minHeight:"100vh", background:"#f9fafb", fontFamily:"system-ui,sans-serif" }}>
@@ -84,17 +174,27 @@ export default function App() {
           <span style={{ color:"#9ca3af", fontSize:13 }}>Research Dashboard</span>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:12 }}>
-          <code style={{ fontSize:11, color:"#6b7280" }}>{sessionId}</code>
+          <code style={{ fontSize:11, color:"#6b7280" }}>{demoMode ? "demo-session" : sessionId}</code>
           <button
-            onClick={() => exportCSV(estimates)}
+            onClick={() => exportCSV(estimates, demoMode ? "demo" : sessionId)}
             disabled={estimates.length === 0}
             style={{ fontSize:12, padding:"6px 14px", borderRadius:6, border:"1px solid #e5e7eb", background:"#fff", cursor:"pointer", opacity: estimates.length === 0 ? 0.4 : 1 }}
           >
             Export CSV
           </button>
-          <StatusPill on={isConnected} />
+          <StatusPill on={isConnected} demo={demoMode} />
         </div>
       </header>
+
+      {demoMode && (
+        <div style={{ background:"#fef9c3", borderBottom:"1px solid #fde68a", padding:"8px 24px", fontSize:12, color:"#92400e", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+          <span>
+            Demo mode -- showing simulated cognitive load data.
+            Install the <a href="https://github.com/Aprameya05/neuroflow" style={{ color:"#92400e", fontWeight:600 }}>Chrome extension</a> to see your real data.
+          </span>
+          <span style={{ color:"#a16207" }}>Live data replaces this automatically when extension connects.</span>
+        </div>
+      )}
 
       <main style={{ maxWidth:1100, margin:"0 auto", padding:24 }}>
         <div style={{ display:"grid", gridTemplateColumns:"210px 1fr", gap:18, marginBottom:18 }}>
@@ -125,16 +225,9 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{ marginTop: 18 }}>
+        <div style={{ marginTop:18 }}>
           <EstimateLog estimates={estimates} />
         </div>
-
-        {!isConnected && (
-          <div style={{ marginTop:18, padding:"12px 16px", background:"#fef2f2", border:"1px solid #fecaca", borderRadius:8, fontSize:13, color:"#b91c1c" }}>
-            Not connected to backend. The Chrome extension must be installed and active for data to appear.
-            Install it from the <a href="https://github.com/Aprameya05/neuroflow" style={{ color:"#b91c1c" }}>GitHub repo</a> and open any webpage.
-          </div>
-        )}
       </main>
     </div>
   );
