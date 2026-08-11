@@ -350,13 +350,6 @@ Auto-deploys on every push to `main`.
 - [ ] Publish `@neuroflow/sdk` to npm
 - [ ] Release labeled calibration dataset
 
----
-
-## Team
-
-**Aprameya** -- backend, ML pipeline, Chrome extension, calibration protocol, infrastructure, model training
-
-**Aashritha** -- TypeScript SDK, React dashboard, reference app, calibration UI, user study design
 
 ---
 
