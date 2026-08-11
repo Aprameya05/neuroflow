@@ -6,10 +6,14 @@
  * - EMA smoothing prevents score bouncing
  * - UI state requires 2s stability before switching
  * - Reconnects are transparent -- UI never flickers on disconnect
+ * - Watch mode: connect to /ws/watch/{sessionId} to observe another session
+ *   without sending behavioral signals (used by session sharing feature)
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const WS_URL = "wss://neuroflow-backend-r6rs.onrender.com/ws/signal";
+const WS_BASE = "wss://neuroflow-backend-r6rs.onrender.com";
+const WS_URL = `${WS_BASE}/ws/signal`;
+const WS_WATCH_URL = `${WS_BASE}/ws/watch`;
 const SAMPLE_RATE_MS = 100;
 const WARMUP_MS = 5000;       // 5s warmup, runs once only
 const EMA_ALPHA = 0.12;       // gentle smoothing
@@ -24,7 +28,13 @@ export interface LoadState {
   confidence: number;
   modelType: string;
   isConnected: boolean;
+  isWatchMode: boolean;
   history: number[];
+}
+
+export interface UseNeuroFlowOptions {
+  /** If true, connect to /ws/watch instead of /ws/signal -- no signals emitted */
+  watchMode?: boolean;
 }
 
 class SignalCollector {
@@ -138,7 +148,12 @@ function scoreToUIState(score: number): UIState {
   return "minimal";
 }
 
-export function useNeuroFlow(sessionId: string): LoadState {
+export function useNeuroFlow(
+  sessionId: string,
+  opts: UseNeuroFlowOptions = {}
+): LoadState {
+  const { watchMode = false } = opts;
+
   const [state, setState] = useState<LoadState>({
     score: 0.3,
     uiState: "normal",
@@ -146,6 +161,7 @@ export function useNeuroFlow(sessionId: string): LoadState {
     confidence: 0,
     modelType: "heuristic",
     isConnected: false,
+    isWatchMode: watchMode,
     history: [],
   });
 
@@ -154,7 +170,7 @@ export function useNeuroFlow(sessionId: string): LoadState {
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Warmup: runs ONCE per page load, never resets on reconnect
-  const warmupDone = useRef(false);
+  const warmupDone = useRef(watchMode); // in watch mode warmup is instant
   const warmupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const warmupStarted = useRef(false);
 
@@ -169,32 +185,42 @@ export function useNeuroFlow(sessionId: string): LoadState {
   const collectorStarted = useRef(false);
 
   const connect = useCallback(() => {
-    const ws = new WebSocket(`${WS_URL}/${sessionId}`);
+    const url = watchMode
+      ? `${WS_WATCH_URL}/${sessionId}`
+      : `${WS_URL}/${sessionId}`;
+
+    const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
       setState(s => ({ ...s, isConnected: true }));
 
-      // Start warmup only on the very first connection, never again
-      if (!warmupStarted.current) {
-        warmupStarted.current = true;
-        warmupTimer.current = setTimeout(() => {
-          warmupDone.current = true;
-        }, WARMUP_MS);
-      }
+      if (!watchMode) {
+        // Start warmup only on the very first connection, never again
+        if (!warmupStarted.current) {
+          warmupStarted.current = true;
+          warmupTimer.current = setTimeout(() => {
+            warmupDone.current = true;
+          }, WARMUP_MS);
+        }
 
-      // Start signal collector only once
-      if (!collectorStarted.current) {
-        collectorStarted.current = true;
-        collectorRef.current = new SignalCollector();
-        collectorRef.current.start((signal) => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(signal));
-        });
+        // Start signal collector only once
+        if (!collectorStarted.current) {
+          collectorStarted.current = true;
+          collectorRef.current = new SignalCollector();
+          collectorRef.current.start((signal) => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(signal));
+          });
+        }
       }
     };
 
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
+
+      // Watch mode handshake acknowledgement
+      if (msg.type === "watch_connected") return;
+
       if (msg.type !== "load_estimate") return;
       if (!warmupDone.current) return;
 
@@ -231,7 +257,7 @@ export function useNeuroFlow(sessionId: string): LoadState {
     };
 
     ws.onerror = () => ws.close();
-  }, [sessionId]);
+  }, [sessionId, watchMode]);
 
   useEffect(() => {
     connect();

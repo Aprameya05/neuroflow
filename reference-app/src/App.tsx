@@ -5,15 +5,32 @@
  * The editor is ALWAYS rendered from frame 1.
  * activeUIState only updates after the hook's warmup + debounce.
  * Reconnects are invisible to the UI.
+ *
+ * Features:
+ * - Ctrl+1-4: force UI states for demo purposes
+ * - ?watch=<sessionId>: watch another session's cognitive load live
+ * - Share button: copies a watch URL to the clipboard
+ * - End session: shows a beautiful post-session report card
  */
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useNeuroFlow } from "./hooks/useNeuroFlow";
 import { AdaptiveEditor } from "./components/AdaptiveEditor";
 import { LoadHUD } from "./components/LoadHUD";
+import { SessionReport } from "./components/SessionReport";
 import { getLoadColor, getLoadColorRgba } from "./utils/theme";
 import type { UIState } from "./hooks/useNeuroFlow";
 
+// ── Session ID resolution ──────────────────────────────────────────────────
+// Priority: ?watch= param (watch mode) > ?session= param > stored > new
+const urlParams = new URLSearchParams(window.location.search);
+const watchParam = urlParams.get("watch");
+const sessionParam = urlParams.get("session");
+
+const IS_WATCH_MODE = Boolean(watchParam);
+
 const SESSION_ID = (() => {
+  if (watchParam) return watchParam;
+  if (sessionParam) return sessionParam;
   const stored = sessionStorage.getItem("nf-session-id");
   if (stored) return stored;
   const id = `editor-${crypto.randomUUID()}`;
@@ -21,9 +38,14 @@ const SESSION_ID = (() => {
   return id;
 })();
 
+// ── State time tracker for report card ────────────────────────────────────
+interface StateLog { state: UIState; startTime: number }
+
 export default function App() {
-  const load = useNeuroFlow(SESSION_ID);
+  const load = useNeuroFlow(SESSION_ID, { watchMode: IS_WATCH_MODE });
   const [showHUD, setShowHUD] = useState(true);
+  const [showReport, setShowReport] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
 
   // activeUIState is the rendered state -- starts as normal, never undefined
   const [activeUIState, setActiveUIState] = useState<UIState>("normal");
@@ -31,8 +53,16 @@ export default function App() {
   const prevUIState = useRef<UIState>("normal");
   const pulseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Forced state: set by Ctrl+1-4 shortcuts, overrides the hook's state
+  const [forcedState, setForcedState] = useState<UIState | null>(null);
+  const forcedStateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Track first render -- skip pulse on initial mount
   const mounted = useRef(false);
+
+  // Session report tracking
+  const sessionStart = useRef(Date.now());
+  const stateLog = useRef<StateLog[]>([{ state: "normal", startTime: Date.now() }]);
 
   useEffect(() => {
     mounted.current = true;
@@ -44,17 +74,87 @@ export default function App() {
     if (load.uiState === prevUIState.current) return;
     prevUIState.current = load.uiState;
 
+    // Track for report card
+    stateLog.current.push({ state: load.uiState, startTime: Date.now() });
+
     if (pulseTimer.current) clearTimeout(pulseTimer.current);
     pulseTimer.current = setTimeout(() => {
-      setActiveUIState(load.uiState);
-      setTransitionKey(k => k + 1);
+      if (!forcedState) {
+        setActiveUIState(load.uiState);
+        setTransitionKey(k => k + 1);
+      }
     }, 400);
 
     return () => {
       if (pulseTimer.current) clearTimeout(pulseTimer.current);
     };
-  }, [load.uiState]);
+  }, [load.uiState, forcedState]);
 
+  // Apply forced state from Ctrl+1-4 shortcuts
+  useEffect(() => {
+    if (forcedState) {
+      stateLog.current.push({ state: forcedState, startTime: Date.now() });
+      setActiveUIState(forcedState);
+      setTransitionKey(k => k + 1);
+    }
+  }, [forcedState]);
+
+  // Ctrl+1-4 keyboard shortcuts to force UI states
+  const forceState = useCallback((state: UIState) => {
+    if (forcedStateTimer.current) clearTimeout(forcedStateTimer.current);
+    setForcedState(state);
+    // Auto-release forced state after 30s so real load can take over again
+    forcedStateTimer.current = setTimeout(() => setForcedState(null), 30_000);
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      if (e.key === "1") { e.preventDefault(); forceState("rich"); }
+      if (e.key === "2") { e.preventDefault(); forceState("normal"); }
+      if (e.key === "3") { e.preventDefault(); forceState("reduced"); }
+      if (e.key === "4") { e.preventDefault(); forceState("minimal"); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [forceState]);
+
+  // Session sharing: copy watch URL to clipboard
+  const handleShare = useCallback(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("watch", SESSION_ID);
+    url.searchParams.delete("session");
+    navigator.clipboard.writeText(url.toString()).then(() => {
+      setCopyFeedback(true);
+      setTimeout(() => setCopyFeedback(false), 2000);
+    });
+  }, []);
+
+  // Compute report card data
+  const computeReportData = useCallback(() => {
+    const now = Date.now();
+    const duration = now - sessionStart.current;
+    const timeInState: Record<UIState, number> = { rich: 0, normal: 0, reduced: 0, minimal: 0 };
+
+    for (let i = 0; i < stateLog.current.length; i++) {
+      const entry = stateLog.current[i];
+      const end = i + 1 < stateLog.current.length ? stateLog.current[i + 1].startTime : now;
+      timeInState[entry.state] += end - entry.startTime;
+    }
+
+    const avg = load.history.length > 0
+      ? load.history.reduce((a, b) => a + b, 0) / load.history.length
+      : load.score;
+    const peak = load.history.length > 0 ? Math.max(...load.history) : load.score;
+
+    // Dominant state (most time in)
+    const dominantState = (Object.entries(timeInState) as [UIState, number][])
+      .sort((a, b) => b[1] - a[1])[0][0];
+
+    return { duration, timeInState, avg, peak, dominantState, dominant: load.dominant };
+  }, [load]);
+
+  const displayState = activeUIState;
   const loadColor = getLoadColor(load.score);
   const loadGlowLow = getLoadColorRgba(load.score, 0.1);
   const loadGlowHigh = getLoadColorRgba(load.score, 0.28);
@@ -70,8 +170,60 @@ export default function App() {
       position: "relative",
       userSelect: "none",
     }}>
+      {/* Watch mode banner */}
+      {IS_WATCH_MODE && (
+        <div style={{
+          position: "absolute",
+          top: 42,
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 200,
+          background: "rgba(99,102,241,0.15)",
+          border: "1px solid rgba(99,102,241,0.4)",
+          borderRadius: 20,
+          padding: "5px 16px",
+          fontSize: 12,
+          color: "#a5b4fc",
+          fontFamily: "'JetBrains Mono', monospace",
+          backdropFilter: "blur(12px)",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          pointerEvents: "none",
+        }}>
+          <span style={{ fontSize: 10 }}>👁</span>
+          Watching session <strong style={{ color: "#c7d2fe" }}>{SESSION_ID.slice(0, 12)}…</strong>
+        </div>
+      )}
+
+      {/* Forced state indicator */}
+      {forcedState && (
+        <div style={{
+          position: "absolute",
+          top: 50,
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 200,
+          background: "rgba(245,158,11,0.15)",
+          border: "1px solid rgba(245,158,11,0.4)",
+          borderRadius: 20,
+          padding: "5px 16px",
+          fontSize: 12,
+          color: "#fcd34d",
+          fontFamily: "'JetBrains Mono', monospace",
+          backdropFilter: "blur(12px)",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          pointerEvents: "none",
+        }}>
+          <span style={{ fontSize: 10 }}>🔒</span>
+          Demo mode: <strong>{forcedState}</strong> — Ctrl+1-4 to switch, auto-releases in 30s
+        </div>
+      )}
+
       {/* Ambient background -- rich mode only */}
-      {activeUIState === "rich" && (
+      {displayState === "rich" && (
         <div style={{
           position: "absolute", inset: 0,
           backgroundImage: `
@@ -105,7 +257,7 @@ export default function App() {
       )}
 
       {/* Zen vignette -- minimal mode only */}
-      {activeUIState === "minimal" && (
+      {displayState === "minimal" && (
         <div style={{
           position: "absolute", inset: 0,
           background: "radial-gradient(circle at center, transparent 38%, rgba(4,6,10,0.8) 100%)",
@@ -119,7 +271,7 @@ export default function App() {
         height: 42,
         background: "rgba(10,13,20,0.75)",
         backdropFilter: "blur(12px)",
-        borderBottom: `1px solid rgba(255,255,255,${activeUIState === "minimal" ? "0.03" : "0.07"})`,
+        borderBottom: `1px solid rgba(255,255,255,${displayState === "minimal" ? "0.03" : "0.07"})`,
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
@@ -152,7 +304,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Center: active file */}
+        {/* Center: mode pill */}
         <div style={{
           display: "flex", alignItems: "center", gap: 6,
           padding: "4px 12px", borderRadius: 20,
@@ -162,11 +314,11 @@ export default function App() {
           fontFamily: "'JetBrains Mono', monospace",
         }}>
           <span style={{ color: loadColor, fontSize: 10 }}>●</span>
-          <span>main.py</span>
+          <span>{IS_WATCH_MODE ? "watch mode" : "editor"}</span>
         </div>
 
-        {/* Right: status + state pill + HUD */}
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        {/* Right: status + state pill + buttons */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{
             display: "flex", alignItems: "center", gap: 6,
             fontSize: 11,
@@ -181,7 +333,7 @@ export default function App() {
               boxShadow: load.isConnected ? "0 0 8px #34d399" : "none",
               animation: load.isConnected ? "pulseDot 2s infinite" : "none",
             }} />
-            <span>{load.isConnected ? "Connected" : "Reconnecting"}</span>
+            <span>{load.isConnected ? (IS_WATCH_MODE ? "Watching" : "Connected") : "Reconnecting"}</span>
           </div>
 
           <div style={{
@@ -198,8 +350,49 @@ export default function App() {
               width: 5, height: 5, borderRadius: "50%",
               background: loadColor, boxShadow: `0 0 6px ${loadColor}`,
             }} />
-            {activeUIState} mode
+            {displayState} mode
           </div>
+
+          {/* Share button */}
+          {!IS_WATCH_MODE && (
+            <button
+              onClick={handleShare}
+              title="Copy a live watch link to clipboard"
+              style={{
+                fontSize: 11, fontWeight: 500, padding: "4px 12px",
+                background: copyFeedback ? "rgba(52,211,153,0.18)" : "rgba(255,255,255,0.04)",
+                border: `1px solid ${copyFeedback ? "rgba(52,211,153,0.38)" : "rgba(255,255,255,0.08)"}`,
+                borderRadius: 6,
+                color: copyFeedback ? "#34d399" : "#94a3b8",
+                cursor: "pointer",
+                transition: "all 0.25s ease",
+                display: "flex", alignItems: "center", gap: 5,
+              }}
+            >
+              <span style={{ fontSize: 10 }}>{copyFeedback ? "✓" : "🔗"}</span>
+              {copyFeedback ? "Copied!" : "Share"}
+            </button>
+          )}
+
+          {/* End session button */}
+          {!IS_WATCH_MODE && (
+            <button
+              onClick={() => setShowReport(true)}
+              title="End session and view report card"
+              style={{
+                fontSize: 11, fontWeight: 500, padding: "4px 12px",
+                background: "rgba(239,68,68,0.08)",
+                border: "1px solid rgba(239,68,68,0.2)",
+                borderRadius: 6,
+                color: "#f87171",
+                cursor: "pointer",
+                transition: "all 0.25s ease",
+                display: "flex", alignItems: "center", gap: 5,
+              }}
+            >
+              <span style={{ fontSize: 10 }}>■</span> End
+            </button>
+          )}
 
           <button
             onClick={() => setShowHUD(h => !h)}
@@ -221,18 +414,29 @@ export default function App() {
 
       {/* Editor -- always rendered from frame 1, never unmounted */}
       <div style={{ flex: 1, overflow: "hidden", position: "relative", zIndex: 1 }}>
-        <AdaptiveEditor uiState={activeUIState} score={load.score} />
+        <AdaptiveEditor uiState={displayState} score={load.score} readOnly={IS_WATCH_MODE} />
       </div>
 
       <LoadHUD
         score={load.score}
-        uiState={activeUIState}
+        uiState={displayState}
         dominant={load.dominant}
         modelType={load.modelType}
         isConnected={load.isConnected}
         history={load.history}
         visible={showHUD}
+        isWatchMode={IS_WATCH_MODE}
+        forcedState={forcedState}
       />
+
+      {/* Post-session report card modal */}
+      {showReport && (
+        <SessionReport
+          data={computeReportData()}
+          onClose={() => setShowReport(false)}
+          sessionId={SESSION_ID}
+        />
+      )}
 
       <style>{`
         @keyframes radialPulse {
@@ -243,6 +447,10 @@ export default function App() {
         @keyframes pulseDot {
           0%, 100% { opacity: 1; transform: scale(1); }
           50%       { opacity: 0.4; transform: scale(0.85); }
+        }
+        @keyframes fadeInUp {
+          from { opacity: 0; transform: translateY(16px); }
+          to   { opacity: 1; transform: translateY(0); }
         }
       `}</style>
     </div>
