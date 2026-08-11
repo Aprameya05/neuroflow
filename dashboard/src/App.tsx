@@ -2,7 +2,7 @@
  * NeuroFlow Research Dashboard
  * Dark sci-fi telemetry interface — CHI 2026.
  */
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type ReactNode, type CSSProperties } from "react";
 import { useNeuroFlowSocket } from "./hooks/useNeuroFlowSocket";
 import { LoadGauge } from "./components/LoadGauge";
 import { LoadTimeline } from "./components/LoadTimeline";
@@ -12,6 +12,9 @@ import { StateDistribution } from "./components/StateDistribution";
 import { SessionStats } from "./components/SessionStats";
 import { SignalMatrix } from "./components/SignalMatrix";
 import { CalibrationFlow } from "./components/CalibrationFlow";
+import { CognitiveFingerprint } from "./components/CognitiveFingerprint";
+import { FlowStreakBanner } from "./components/FlowStreakBanner";
+import { SessionReplayPlayer } from "./components/SessionReplayPlayer";
 import { loadColor, loadColorRgba } from "./utils/colors";
 import type { LoadEstimate } from "./types";
 
@@ -66,7 +69,7 @@ function exportCSV(estimates: LoadEstimate[], sessionId: string) {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function GlowCard({ children, style = {} }: { children: React.ReactNode; style?: React.CSSProperties }) {
+function GlowCard({ children, style = {} }: { children: ReactNode; style?: CSSProperties }) {
   return (
     <div style={{
       background: "rgba(10,13,20,0.85)",
@@ -134,6 +137,7 @@ export default function App() {
   const [view, setView] = useState<View>("monitor");
   const { estimates: liveEstimates, currentLoad: liveLoad, isConnected } = useNeuroFlowSocket(sessionId);
 
+  const [showReplay, setShowReplay] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
   const [demoEstimates, setDemoEstimates] = useState<LoadEstimate[]>([]);
   const demoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -275,20 +279,36 @@ export default function App() {
           </code>
 
           {view === "monitor" && (
-            <button
-              onClick={() => exportCSV(estimates, demoMode ? "demo" : sessionId)}
-              disabled={estimates.length === 0}
-              style={{
-                fontSize: 11, padding: "6px 14px", borderRadius: 7,
-                border: "1px solid rgba(255,255,255,0.08)",
-                background: "rgba(255,255,255,0.03)",
-                color: estimates.length === 0 ? "#1e293b" : "#94a3b8",
-                cursor: estimates.length === 0 ? "default" : "pointer",
-                fontFamily: "'Inter', sans-serif", fontWeight: 500,
-              }}
-            >
-              Export CSV
-            </button>
+            <>
+              <button
+                onClick={() => setShowReplay(true)}
+                disabled={estimates.length < 5}
+                style={{
+                  fontSize: 11, padding: "6px 14px", borderRadius: 7,
+                  border: "1px solid rgba(99,102,241,0.25)",
+                  background: estimates.length >= 5 ? "rgba(99,102,241,0.1)" : "rgba(255,255,255,0.02)",
+                  color: estimates.length >= 5 ? "#a5b4fc" : "#1e293b",
+                  cursor: estimates.length >= 5 ? "pointer" : "default",
+                  fontFamily: "'Inter', sans-serif", fontWeight: 500,
+                }}
+              >
+                ▶ Replay
+              </button>
+              <button
+                onClick={() => exportCSV(estimates, demoMode ? "demo" : sessionId)}
+                disabled={estimates.length === 0}
+                style={{
+                  fontSize: 11, padding: "6px 14px", borderRadius: 7,
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  background: "rgba(255,255,255,0.03)",
+                  color: estimates.length === 0 ? "#1e293b" : "#94a3b8",
+                  cursor: estimates.length === 0 ? "default" : "pointer",
+                  fontFamily: "'Inter', sans-serif", fontWeight: 500,
+                }}
+              >
+                Export CSV
+              </button>
+            </>
           )}
 
           {/* Connection pill */}
@@ -361,6 +381,9 @@ export default function App() {
                   Cognitive Load
                 </div>
                 <LoadGauge load={currentLoad} size={210} />
+                <div style={{ marginTop: 12 }}>
+                  <FlowStreakBanner estimates={estimates} />
+                </div>
               </GlowCard>
 
               {/* Stat cards */}
@@ -433,25 +456,31 @@ export default function App() {
               </GlowCard>
             </div>
 
-            {/* Row 3: State distribution + Session stats + Signal matrix */}
-            <div style={{ display: "grid", gridTemplateColumns: "280px 1fr 1fr", gap: 16, marginBottom: 16 }}>
+            {/* Row 3: State distribution + Cognitive fingerprint + Session stats */}
+            <div style={{ display: "grid", gridTemplateColumns: "280px 260px 1fr", gap: 16, marginBottom: 16 }}>
               <GlowCard style={{ padding: "18px 20px" }}>
                 <CardHeader title="UI state distribution" sub="States" />
                 <StateDistribution estimates={estimates} />
               </GlowCard>
 
               <GlowCard style={{ padding: "18px 20px" }}>
-                <CardHeader title="Session metrics" sub="Stats" />
-                <SessionStats estimates={estimates} currentLoad={currentLoad} />
+                <CardHeader title="Behavioral fingerprint" sub="Fingerprint" />
+                <CognitiveFingerprint estimates={estimates} />
               </GlowCard>
 
               <GlowCard style={{ padding: "18px 20px" }}>
-                <CardHeader title="Signal activity heatmap" sub="Matrix" />
-                <SignalMatrix estimates={estimates} />
+                <CardHeader title="Session metrics" sub="Stats" />
+                <SessionStats estimates={estimates} currentLoad={currentLoad} />
               </GlowCard>
             </div>
 
-            {/* Row 4: Live log */}
+            {/* Row 4: Signal matrix */}
+            <GlowCard style={{ padding: "18px 20px", marginBottom: 16 }}>
+              <CardHeader title="Signal activity heatmap" sub="Matrix" />
+              <SignalMatrix estimates={estimates} />
+            </GlowCard>
+
+            {/* Row 5: Live log */}
             <EstimateLog estimates={estimates} />
           </>
         )}
@@ -590,6 +619,11 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Session replay modal */}
+      {showReplay && (
+        <SessionReplayPlayer estimates={estimates} onClose={() => setShowReplay(false)} />
+      )}
     </div>
   );
 }

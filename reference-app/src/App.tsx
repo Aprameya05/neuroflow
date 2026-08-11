@@ -17,6 +17,7 @@ import { useNeuroFlow } from "./hooks/useNeuroFlow";
 import { AdaptiveEditor } from "./components/AdaptiveEditor";
 import { LoadHUD } from "./components/LoadHUD";
 import { SessionReport } from "./components/SessionReport";
+import { FlowCelebration } from "./components/FlowCelebration";
 import { getLoadColor, getLoadColorRgba } from "./utils/theme";
 import type { UIState } from "./hooks/useNeuroFlow";
 
@@ -170,6 +171,9 @@ export default function App() {
       position: "relative",
       userSelect: "none",
     }}>
+      {/* Flow celebration overlay (particles + glow on entering flow state) */}
+      {!IS_WATCH_MODE && <FlowCelebration activeUIState={displayState} />}
+
       {/* Watch mode banner */}
       {IS_WATCH_MODE && (
         <div style={{
