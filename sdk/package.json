@@ -1,19 +1,65 @@
 {
   "name": "@neuroflow/sdk",
   "version": "0.1.0",
-  "description": "Adaptive cognitive load interface SDK",
+  "description": "Real-time cognitive load adaptive interface SDK — no EEG, no wearables, just behavior.",
+  "keywords": [
+    "cognitive-load",
+    "adaptive-ui",
+    "hci",
+    "behavioral-signals",
+    "accessibility",
+    "ux",
+    "react",
+    "websocket"
+  ],
+  "author": "Aprameya Bharadwaj <aprameya.bharadwaj.05@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/Aprameya05/neuroflow#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Aprameya05/neuroflow.git",
+    "directory": "sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/Aprameya05/neuroflow/issues"
+  },
   "main": "dist/index.js",
+  "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
     "react": ">=18.0.0"
   },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/react": "^18.3.3",
     "typescript": "^5.5.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

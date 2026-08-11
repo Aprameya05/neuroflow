@@ -5,7 +5,13 @@ from typing import List
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://neuroflow:neuroflow@localhost/neuroflow"
     REDIS_URL: str = "redis://localhost:6379"
-    ALLOWED_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173"]
+    ALLOWED_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "https://neuroflow-dashboard.pages.dev",
+        "https://neuroflow-editor.pages.dev",
+    ]
     SECRET_KEY: str = "change-in-production"
     MODEL_PATH: str = "app/ml/models/cognitive_load_lstm.onnx"
     SIGNAL_WINDOW_MS: int = 3000

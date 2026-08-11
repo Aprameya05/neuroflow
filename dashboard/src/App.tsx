@@ -4,7 +4,10 @@ import { LoadGauge } from "./components/LoadGauge";
 import { LoadTimeline } from "./components/LoadTimeline";
 import { SignalBreakdown } from "./components/SignalBreakdown";
 import { EstimateLog } from "./components/EstimateLog";
+import { CalibrationFlow } from "./components/CalibrationFlow";
 import type { LoadEstimate } from "./types";
+
+type View = "monitor" | "calibration" | "about";
 
 const SESSION_ID = (() => {
   const stored = sessionStorage.getItem("nf-dashboard-session");
@@ -103,6 +106,7 @@ function exportCSV(estimates: LoadEstimate[], sessionId: string) {
 
 export default function App() {
   const [sessionId] = useState(SESSION_ID);
+  const [view, setView] = useState<View>("monitor");
   const { estimates: liveEstimates, currentLoad: liveLoad, isConnected } = useNeuroFlowSocket(sessionId);
 
   // Demo mode: active when not connected after 3 seconds
@@ -174,14 +178,35 @@ export default function App() {
           <span style={{ color:"#9ca3af", fontSize:13 }}>Research Dashboard</span>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          {/* Tab switcher */}
+          <div style={{ display:"flex", background:"#f3f4f6", borderRadius:8, padding:3, gap:2 }}>
+            {(["monitor", "calibration", "about"] as View[]).map(v => (
+              <button
+                key={v}
+                onClick={() => setView(v)}
+                style={{
+                  padding:"5px 14px", borderRadius:6, border:"none", cursor:"pointer",
+                  fontSize:12, fontWeight:500, transition:"all 0.15s ease",
+                  background: view === v ? "#fff" : "transparent",
+                  color: view === v ? "#111827" : "#6b7280",
+                  boxShadow: view === v ? "0 1px 3px rgba(0,0,0,0.1)" : "none",
+                  textTransform:"capitalize",
+                }}
+              >
+                {v === "monitor" ? "Live Monitor" : v === "calibration" ? "Calibration" : "About"}
+              </button>
+            ))}
+          </div>
           <code style={{ fontSize:11, color:"#6b7280" }}>{demoMode ? "demo-session" : sessionId}</code>
-          <button
-            onClick={() => exportCSV(estimates, demoMode ? "demo" : sessionId)}
-            disabled={estimates.length === 0}
-            style={{ fontSize:12, padding:"6px 14px", borderRadius:6, border:"1px solid #e5e7eb", background:"#fff", cursor:"pointer", opacity: estimates.length === 0 ? 0.4 : 1 }}
-          >
-            Export CSV
-          </button>
+          {view === "monitor" && (
+            <button
+              onClick={() => exportCSV(estimates, demoMode ? "demo" : sessionId)}
+              disabled={estimates.length === 0}
+              style={{ fontSize:12, padding:"6px 14px", borderRadius:6, border:"1px solid #e5e7eb", background:"#fff", cursor:"pointer", opacity: estimates.length === 0 ? 0.4 : 1 }}
+            >
+              Export CSV
+            </button>
+          )}
           <StatusPill on={isConnected} demo={demoMode} />
         </div>
       </header>
@@ -197,37 +222,95 @@ export default function App() {
       )}
 
       <main style={{ maxWidth:1100, margin:"0 auto", padding:24 }}>
-        <div style={{ display:"grid", gridTemplateColumns:"210px 1fr", gap:18, marginBottom:18 }}>
-          <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:20, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
-            <p style={{ margin:0, fontSize:11, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.05em" }}>Current load</p>
-            <LoadGauge load={currentLoad} size={158} />
-          </div>
-          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:16 }}>
-            <StatCard label="Estimates received" value={estimates.length.toLocaleString()} />
-            <StatCard label="Session avg" value={avg !== null ? `${Math.round(avg*100)}%` : "—"} />
-            <StatCard label="Peak load" value={peak !== null ? `${Math.round(peak*100)}%` : "—"} />
-          </div>
-          <UIStateBadge load={currentLoad} />
-        </div>
+        {/* ── Live Monitor ── */}
+        {view === "monitor" && (
+          <>
+            <div style={{ display:"grid", gridTemplateColumns:"210px 1fr", gap:18, marginBottom:18 }}>
+              <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:20, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+                <p style={{ margin:0, fontSize:11, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.05em" }}>Current load</p>
+                <LoadGauge load={currentLoad} size={158} />
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:16 }}>
+                <StatCard label="Estimates received" value={estimates.length.toLocaleString()} />
+                <StatCard label="Session avg" value={avg !== null ? `${Math.round(avg*100)}%` : "—"} />
+                <StatCard label="Peak load" value={peak !== null ? `${Math.round(peak*100)}%` : "—"} />
+              </div>
+              <UIStateBadge load={currentLoad} />
+            </div>
 
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 280px", gap:18 }}>
-          <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"18px 22px" }}>
-            <p style={{ margin:"0 0 14px", fontSize:13, fontWeight:500, color:"#374151" }}>Load over time</p>
-            {estimates.length === 0
-              ? <div style={{ height:220, display:"flex", alignItems:"center", justifyContent:"center", color:"#9ca3af", fontSize:13 }}>Waiting for signal data…</div>
-              : <LoadTimeline estimates={estimates} />}
-          </div>
-          <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"18px 22px" }}>
-            <p style={{ margin:"0 0 14px", fontSize:13, fontWeight:500, color:"#374151" }}>Dominant signals</p>
-            {estimates.length < 5
-              ? <p style={{ fontSize:13, color:"#9ca3af" }}>Collecting…</p>
-              : <SignalBreakdown estimates={estimates} />}
-          </div>
-        </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 280px", gap:18 }}>
+              <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"18px 22px" }}>
+                <p style={{ margin:"0 0 14px", fontSize:13, fontWeight:500, color:"#374151" }}>Load over time</p>
+                {estimates.length === 0
+                  ? <div style={{ height:220, display:"flex", alignItems:"center", justifyContent:"center", color:"#9ca3af", fontSize:13 }}>Waiting for signal data…</div>
+                  : <LoadTimeline estimates={estimates} />}
+              </div>
+              <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"18px 22px" }}>
+                <p style={{ margin:"0 0 14px", fontSize:13, fontWeight:500, color:"#374151" }}>Dominant signals</p>
+                {estimates.length < 5
+                  ? <p style={{ fontSize:13, color:"#9ca3af" }}>Collecting…</p>
+                  : <SignalBreakdown estimates={estimates} />}
+              </div>
+            </div>
 
-        <div style={{ marginTop:18 }}>
-          <EstimateLog estimates={estimates} />
-        </div>
+            <div style={{ marginTop:18 }}>
+              <EstimateLog estimates={estimates} />
+            </div>
+          </>
+        )}
+
+        {/* ── Calibration ── */}
+        {view === "calibration" && (
+          <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"28px 32px" }}>
+            <CalibrationFlow userId={sessionId} />
+          </div>
+        )}
+
+        {/* ── About ── */}
+        {view === "about" && (
+          <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"32px 40px", maxWidth:720 }}>
+            <h2 style={{ margin:"0 0 12px", color:"#111827", fontSize:22 }}>About NeuroFlow</h2>
+            <p style={{ color:"#4b5563", lineHeight:1.7, marginBottom:16 }}>
+              NeuroFlow is a real-time cognitive load adaptive interface system.
+              It infers cognitive load from behavioral signals — keystroke rhythm,
+              mouse movement entropy, error rate, pause patterns — and dynamically
+              adapts interface complexity in response. No EEG. No wearables. No
+              physiological sensors.
+            </p>
+            <p style={{ color:"#4b5563", lineHeight:1.7, marginBottom:16 }}>
+              This is a CHI 2026 target research project.
+              The system trains a bidirectional LSTM on labeled calibration data
+              to personalise the load model for each user.
+            </p>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:24 }}>
+              {[
+                { label:"Backend", value:"FastAPI + WebSocket on Render" },
+                { label:"ML model", value:"BiLSTM (ONNX export)" },
+                { label:"SDK", value:"@neuroflow/sdk (TypeScript)" },
+                { label:"Target conference", value:"CHI 2026" },
+              ].map(item => (
+                <div key={item.label} style={{ background:"#f9fafb", borderRadius:8, padding:"12px 16px" }}>
+                  <p style={{ margin:"0 0 4px", fontSize:11, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.05em" }}>{item.label}</p>
+                  <p style={{ margin:0, fontSize:14, fontWeight:500, color:"#111827" }}>{item.value}</p>
+                </div>
+              ))}
+            </div>
+            <div style={{ display:"flex", gap:12 }}>
+              <a href="https://github.com/Aprameya05/neuroflow" target="_blank" rel="noreferrer"
+                style={{ padding:"8px 18px", background:"#111827", color:"#fff", borderRadius:6, textDecoration:"none", fontSize:13, fontWeight:500 }}>
+                GitHub →
+              </a>
+              <a href="https://neuroflow-editor.pages.dev" target="_blank" rel="noreferrer"
+                style={{ padding:"8px 18px", background:"#6366f1", color:"#fff", borderRadius:6, textDecoration:"none", fontSize:13, fontWeight:500 }}>
+                Try the adaptive editor →
+              </a>
+              <a href="https://neuroflow-backend-r6rs.onrender.com/docs" target="_blank" rel="noreferrer"
+                style={{ padding:"8px 18px", background:"#fff", color:"#374151", border:"1px solid #e5e7eb", borderRadius:6, textDecoration:"none", fontSize:13, fontWeight:500 }}>
+                API docs →
+              </a>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

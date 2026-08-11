@@ -13,6 +13,8 @@ interface LoadHUDProps {
   isConnected: boolean;
   history: number[];
   visible: boolean;
+  isWatchMode?: boolean;
+  forcedState?: UIState | null;
 }
 
 const STATE_INFO = {
@@ -92,7 +94,7 @@ function HardwareSparkline({ history, loadColor }: { history: number[]; loadColo
   );
 }
 
-export function LoadHUD({ score, uiState, dominant, modelType, isConnected, history, visible }: LoadHUDProps) {
+export function LoadHUD({ score, uiState, dominant, modelType, isConnected, history, visible, isWatchMode, forcedState }: LoadHUDProps) {
   if (!visible) return null;
 
   const pct = Math.round(score * 100);
@@ -146,17 +148,33 @@ export function LoadHUD({ score, uiState, dominant, modelType, isConnected, hist
           </span>
         </div>
 
-        <span style={{
-          fontSize: 9,
-          fontWeight: 700,
-          padding: "1px 6px",
-          borderRadius: 4,
-          background: "rgba(255, 255, 255, 0.05)",
-          color: "#cbd5e1",
-          fontFamily: "'JetBrains Mono', monospace",
-        }}>
-          {modelType === "onnx" ? "ML" : "HEURISTIC"}
-        </span>
+        <div style={{ display: "flex", gap: 5 }}>
+          {isWatchMode && (
+            <span style={{
+              fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
+              background: "rgba(99,102,241,0.15)", color: "#a5b4fc",
+              fontFamily: "'JetBrains Mono', monospace",
+            }}>
+              👁 WATCH
+            </span>
+          )}
+          {forcedState && (
+            <span style={{
+              fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
+              background: "rgba(245,158,11,0.15)", color: "#fcd34d",
+              fontFamily: "'JetBrains Mono', monospace",
+            }}>
+              DEMO
+            </span>
+          )}
+          <span style={{
+            fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
+            background: "rgba(255, 255, 255, 0.05)", color: "#cbd5e1",
+            fontFamily: "'JetBrains Mono', monospace",
+          }}>
+            {modelType === "onnx" ? "ML" : "HEURISTIC"}
+          </span>
+        </div>
       </div>
 
       {/* Main Load percentage & State pill */}
