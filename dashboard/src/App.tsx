@@ -1,10 +1,18 @@
+/**
+ * NeuroFlow Research Dashboard
+ * Dark sci-fi telemetry interface — CHI 2026.
+ */
 import { useState, useEffect, useRef } from "react";
 import { useNeuroFlowSocket } from "./hooks/useNeuroFlowSocket";
 import { LoadGauge } from "./components/LoadGauge";
 import { LoadTimeline } from "./components/LoadTimeline";
 import { SignalBreakdown } from "./components/SignalBreakdown";
 import { EstimateLog } from "./components/EstimateLog";
+import { StateDistribution } from "./components/StateDistribution";
+import { SessionStats } from "./components/SessionStats";
+import { SignalMatrix } from "./components/SignalMatrix";
 import { CalibrationFlow } from "./components/CalibrationFlow";
+import { loadColor, loadColorRgba } from "./utils/colors";
 import type { LoadEstimate } from "./types";
 
 type View = "monitor" | "calibration" | "about";
@@ -20,23 +28,18 @@ const SESSION_ID = (() => {
 const DOMINANT_SIGNALS = [
   "pause_duration_ms", "error_rate", "mouse_velocity",
   "keystroke_iki_ms", "tab_switches", "scroll_velocity",
+  "mouse_acceleration", "mouse_direction_changes", "copy_paste_count",
 ];
 
-// Generates realistic simulated load data for demo mode
 function generateDemoEstimates(count: number): LoadEstimate[] {
   const estimates: LoadEstimate[] = [];
   let load = 0.35;
   const now = Date.now();
-
   for (let i = count; i >= 0; i--) {
-    // Simulate realistic cognitive load pattern -- gradual changes with occasional spikes
     const drift = (Math.random() - 0.48) * 0.06;
     load = Math.max(0.05, Math.min(0.95, load + drift));
-    // Occasional load spikes (simulates a difficult task moment)
     if (Math.random() < 0.03) load = Math.min(0.95, load + 0.25);
-    // Occasional recovery (simulates a break)
     if (Math.random() < 0.02) load = Math.max(0.1, load - 0.2);
-
     estimates.push({
       type: "load_estimate",
       load: Math.round(load * 1000) / 1000,
@@ -49,47 +52,6 @@ function generateDemoEstimates(count: number): LoadEstimate[] {
   return estimates;
 }
 
-function StatusPill({ on, demo }: { on: boolean; demo: boolean }) {
-  if (demo) return (
-    <span style={{ display:"inline-flex", alignItems:"center", gap:6, fontSize:12, padding:"3px 10px", borderRadius:99, background:"#fef9c3", color:"#854d0e" }}>
-      <span style={{ width:7, height:7, borderRadius:"50%", background:"#f59e0b" }} />
-      Demo mode
-    </span>
-  );
-  return (
-    <span style={{ display:"inline-flex", alignItems:"center", gap:6, fontSize:12, padding:"3px 10px", borderRadius:99, background: on?"#dcfce7":"#fef2f2", color: on?"#15803d":"#b91c1c" }}>
-      <span style={{ width:7, height:7, borderRadius:"50%", background: on?"#22c55e":"#ef4444" }} />
-      {on ? "Live" : "Disconnected"}
-    </span>
-  );
-}
-
-function StatCard({ label, value }: { label: string; value: string }) {
-  return (
-    <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"18px 22px" }}>
-      <p style={{ margin:"0 0 6px", fontSize:12, color:"#9ca3af" }}>{label}</p>
-      <p style={{ margin:0, fontSize:26, fontWeight:600, color:"#111827" }}>{value}</p>
-    </div>
-  );
-}
-
-function UIStateBadge({ load }: { load: number | null }) {
-  if (load === null) return null;
-  const state = load < 0.21 ? "rich" : load < 0.30 ? "normal" : load < 0.65 ? "reduced" : "minimal";
-  const styles = {
-    rich:    { bg: "#dcfce7", text: "#15803d", label: "Rich UI -- all features visible" },
-    normal:  { bg: "#eff6ff", text: "#1d4ed8", label: "Normal UI" },
-    reduced: { bg: "#fef9c3", text: "#854d0e", label: "Reduced UI -- simplifying interface" },
-    minimal: { bg: "#fef2f2", text: "#b91c1c", label: "Minimal UI -- focus mode active" },
-  };
-  const s = styles[state];
-  return (
-    <div style={{ background: s.bg, color: s.text, padding: "10px 16px", borderRadius: 8, fontSize: 13, fontWeight: 500, marginTop: 16 }}>
-      Current state: <strong>{state}</strong> -- {s.label}
-    </div>
-  );
-}
-
 function exportCSV(estimates: LoadEstimate[], sessionId: string) {
   const header = "timestamp,load,confidence,dominant\n";
   const rows = estimates.map(e =>
@@ -98,18 +60,80 @@ function exportCSV(estimates: LoadEstimate[], sessionId: string) {
   const blob = new Blob([header + rows], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url;
-  a.download = `neuroflow-${sessionId}.csv`;
-  a.click();
+  a.href = url; a.download = `neuroflow-${sessionId}.csv`; a.click();
   URL.revokeObjectURL(url);
 }
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function GlowCard({ children, style = {} }: { children: React.ReactNode; style?: React.CSSProperties }) {
+  return (
+    <div style={{
+      background: "rgba(10,13,20,0.85)",
+      border: "1px solid rgba(255,255,255,0.07)",
+      borderRadius: 14,
+      backdropFilter: "blur(12px)",
+      ...style,
+    }}>
+      {children}
+    </div>
+  );
+}
+
+function CardHeader({ title, sub }: { title: string; sub?: string }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{
+        fontSize: 10, fontWeight: 700, color: "#475569",
+        textTransform: "uppercase", letterSpacing: "0.1em",
+        fontFamily: "'JetBrains Mono', monospace", marginBottom: 2,
+      }}>
+        {sub ?? "NeuroFlow"}
+      </div>
+      <div style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8" }}>{title}</div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, color, glow }: {
+  label: string; value: string; color?: string; glow?: boolean;
+}) {
+  const c = color ?? "#f8fafc";
+  return (
+    <GlowCard style={{ padding: "18px 20px" }}>
+      <div style={{
+        fontSize: 9, fontWeight: 700, color: "#334155",
+        textTransform: "uppercase", letterSpacing: "0.1em",
+        fontFamily: "'JetBrains Mono', monospace", marginBottom: 10,
+      }}>
+        {label}
+      </div>
+      <div style={{
+        fontSize: 28, fontWeight: 800, color: c,
+        fontFamily: "'JetBrains Mono', monospace",
+        letterSpacing: "-0.03em",
+        textShadow: glow ? `0 0 20px ${c}80` : "none",
+        transition: "all 0.4s ease",
+      }}>
+        {value}
+      </div>
+    </GlowCard>
+  );
+}
+
+const NAV_ITEMS = [
+  { id: "monitor",     icon: "◈", label: "Live Monitor" },
+  { id: "calibration", icon: "⬡", label: "Calibration" },
+  { id: "about",       icon: "◉", label: "About" },
+] as const;
+
+// ── Main App ──────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [sessionId] = useState(SESSION_ID);
   const [view, setView] = useState<View>("monitor");
   const { estimates: liveEstimates, currentLoad: liveLoad, isConnected } = useNeuroFlowSocket(sessionId);
 
-  // Demo mode: active when not connected after 3 seconds
   const [demoMode, setDemoMode] = useState(false);
   const [demoEstimates, setDemoEstimates] = useState<LoadEstimate[]>([]);
   const demoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -117,19 +141,14 @@ export default function App() {
 
   useEffect(() => {
     if (isConnected) {
-      // Real connection -- kill demo mode
       setDemoMode(false);
       if (demoTimer.current) clearTimeout(demoTimer.current);
       if (demoInterval.current) clearInterval(demoInterval.current);
       return;
     }
-
-    // Start demo mode after 3 seconds of no connection
     demoTimer.current = setTimeout(() => {
       setDemoMode(true);
-      setDemoEstimates(generateDemoEstimates(100));
-
-      // Keep adding new demo estimates every 300ms
+      setDemoEstimates(generateDemoEstimates(120));
       demoInterval.current = setInterval(() => {
         setDemoEstimates(prev => {
           const last = prev[prev.length - 1];
@@ -139,22 +158,18 @@ export default function App() {
           if (Math.random() < 0.03) newLoad = Math.min(0.95, newLoad + 0.25);
           if (Math.random() < 0.02) newLoad = Math.max(0.1, newLoad - 0.2);
           newLoad = Math.round(newLoad * 1000) / 1000;
-
-          const newEstimate: LoadEstimate = {
-            type: "load_estimate",
+          const next = [...prev, {
+            type: "load_estimate" as const,
             load: newLoad,
             confidence: 0.4 + Math.random() * 0.3,
             dominant: DOMINANT_SIGNALS[Math.floor(Math.random() * DOMINANT_SIGNALS.length)],
             ts: Date.now(),
             session_id: "demo-session",
-          };
-
-          const next = [...prev, newEstimate];
-          return next.length > 300 ? next.slice(-300) : next;
+          }];
+          return next.length > 400 ? next.slice(-400) : next;
         });
       }, 300);
     }, 3000);
-
     return () => {
       if (demoTimer.current) clearTimeout(demoTimer.current);
       if (demoInterval.current) clearInterval(demoInterval.current);
@@ -162,153 +177,416 @@ export default function App() {
   }, [isConnected]);
 
   const estimates = isConnected ? liveEstimates : demoEstimates;
-  const currentLoad = isConnected
-    ? liveLoad
+  const currentLoad = isConnected ? liveLoad
     : demoEstimates.length > 0 ? demoEstimates[demoEstimates.length - 1].load : null;
 
   const avg = estimates.length > 0 ? estimates.reduce((s, e) => s + e.load, 0) / estimates.length : null;
   const peak = estimates.length > 0 ? Math.max(...estimates.map(e => e.load)) : null;
 
+  const cl = currentLoad ?? 0;
+  const clColor = loadColor(cl);
+  const clGlow = loadColorRgba(cl, 0.2);
+
   return (
-    <div style={{ minHeight:"100vh", background:"#f9fafb", fontFamily:"system-ui,sans-serif" }}>
-      <header style={{ background:"#fff", borderBottom:"1px solid #e5e7eb", padding:"13px 24px", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={{ width:28, height:28, borderRadius:8, background:"#6366f1", display:"flex", alignItems:"center", justifyContent:"center", color:"#fff", fontSize:14, fontWeight:700 }}>N</div>
-          <span style={{ fontWeight:600, fontSize:15 }}>NeuroFlow</span>
-          <span style={{ color:"#9ca3af", fontSize:13 }}>Research Dashboard</span>
+    <div style={{
+      minHeight: "100vh",
+      background: "#080b12",
+      backgroundImage: `
+        radial-gradient(circle at 15% 10%, rgba(99,102,241,0.04) 0%, transparent 40%),
+        radial-gradient(circle at 85% 90%, ${clGlow} 0%, transparent 40%)
+      `,
+      fontFamily: "'Inter', system-ui, sans-serif",
+      color: "#f8fafc",
+      transition: "background-image 1s ease",
+    }}>
+      {/* ── Header ── */}
+      <header style={{
+        height: 56,
+        background: "rgba(8,11,18,0.92)",
+        backdropFilter: "blur(16px)",
+        borderBottom: "1px solid rgba(255,255,255,0.06)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        padding: "0 24px",
+        position: "sticky",
+        top: 0,
+        zIndex: 100,
+      }}>
+        {/* Logo */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{
+            width: 30, height: 30, borderRadius: 8,
+            background: `linear-gradient(135deg, #6366f1, ${clColor})`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 14, fontWeight: 800, color: "#fff",
+            fontFamily: "'JetBrains Mono', monospace",
+            boxShadow: `0 0 16px ${clGlow}`,
+            transition: "box-shadow 0.5s ease",
+          }}>
+            N
+          </div>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc", letterSpacing: "0.02em" }}>
+              NeuroFlow
+            </div>
+            <div style={{ fontSize: 10, color: "#334155", fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.06em" }}>
+              RESEARCH DASHBOARD
+            </div>
+          </div>
         </div>
-        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
-          {/* Tab switcher */}
-          <div style={{ display:"flex", background:"#f3f4f6", borderRadius:8, padding:3, gap:2 }}>
-            {(["monitor", "calibration", "about"] as View[]).map(v => (
+
+        {/* Nav */}
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          {NAV_ITEMS.map(item => {
+            const active = view === item.id;
+            return (
               <button
-                key={v}
-                onClick={() => setView(v)}
+                key={item.id}
+                onClick={() => setView(item.id as View)}
                 style={{
-                  padding:"5px 14px", borderRadius:6, border:"none", cursor:"pointer",
-                  fontSize:12, fontWeight:500, transition:"all 0.15s ease",
-                  background: view === v ? "#fff" : "transparent",
-                  color: view === v ? "#111827" : "#6b7280",
-                  boxShadow: view === v ? "0 1px 3px rgba(0,0,0,0.1)" : "none",
-                  textTransform:"capitalize",
+                  display: "flex", alignItems: "center", gap: 7,
+                  padding: "7px 14px", borderRadius: 8,
+                  border: active ? `1px solid rgba(255,255,255,0.1)` : "1px solid transparent",
+                  background: active ? "rgba(255,255,255,0.06)" : "transparent",
+                  color: active ? "#f8fafc" : "#475569",
+                  cursor: "pointer", fontSize: 12, fontWeight: active ? 600 : 400,
+                  transition: "all 0.15s ease",
+                  fontFamily: "'Inter', sans-serif",
                 }}
               >
-                {v === "monitor" ? "Live Monitor" : v === "calibration" ? "Calibration" : "About"}
+                <span style={{ fontSize: 11, opacity: active ? 1 : 0.5 }}>{item.icon}</span>
+                {item.label}
               </button>
-            ))}
-          </div>
-          <code style={{ fontSize:11, color:"#6b7280" }}>{demoMode ? "demo-session" : sessionId}</code>
+            );
+          })}
+        </div>
+
+        {/* Right: session + controls */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <code style={{
+            fontSize: 10, color: "#2d3748",
+            fontFamily: "'JetBrains Mono', monospace",
+            background: "rgba(255,255,255,0.03)",
+            padding: "4px 10px", borderRadius: 6,
+            border: "1px solid rgba(255,255,255,0.05)",
+          }}>
+            {(demoMode ? "demo-session" : sessionId).slice(0, 18)}
+          </code>
+
           {view === "monitor" && (
             <button
               onClick={() => exportCSV(estimates, demoMode ? "demo" : sessionId)}
               disabled={estimates.length === 0}
-              style={{ fontSize:12, padding:"6px 14px", borderRadius:6, border:"1px solid #e5e7eb", background:"#fff", cursor:"pointer", opacity: estimates.length === 0 ? 0.4 : 1 }}
+              style={{
+                fontSize: 11, padding: "6px 14px", borderRadius: 7,
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.03)",
+                color: estimates.length === 0 ? "#1e293b" : "#94a3b8",
+                cursor: estimates.length === 0 ? "default" : "pointer",
+                fontFamily: "'Inter', sans-serif", fontWeight: 500,
+              }}
             >
               Export CSV
             </button>
           )}
-          <StatusPill on={isConnected} demo={demoMode} />
+
+          {/* Connection pill */}
+          <div style={{
+            display: "flex", alignItems: "center", gap: 7,
+            padding: "5px 12px", borderRadius: 20,
+            background: demoMode ? "rgba(245,158,11,0.1)"
+              : isConnected ? "rgba(52,211,153,0.1)" : "rgba(239,68,68,0.1)",
+            border: `1px solid ${demoMode ? "rgba(245,158,11,0.25)" : isConnected ? "rgba(52,211,153,0.25)" : "rgba(239,68,68,0.25)"}`,
+            fontSize: 11, fontWeight: 600,
+            color: demoMode ? "#f59e0b" : isConnected ? "#34d399" : "#ef4444",
+          }}>
+            <div style={{
+              width: 6, height: 6, borderRadius: "50%",
+              background: demoMode ? "#f59e0b" : isConnected ? "#34d399" : "#ef4444",
+              boxShadow: `0 0 6px ${demoMode ? "#f59e0b" : isConnected ? "#34d399" : "#ef4444"}`,
+              animation: (demoMode || isConnected) ? "blink 2s infinite" : "none",
+            }} />
+            {demoMode ? "Demo" : isConnected ? "Live" : "Offline"}
+          </div>
         </div>
       </header>
 
+      {/* Demo banner */}
       {demoMode && (
-        <div style={{ background:"#fef9c3", borderBottom:"1px solid #fde68a", padding:"8px 24px", fontSize:12, color:"#92400e", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-          <span>
-            Demo mode -- showing simulated cognitive load data.
-            Install the <a href="https://github.com/Aprameya05/neuroflow" style={{ color:"#92400e", fontWeight:600 }}>Chrome extension</a> to see your real data.
+        <div style={{
+          background: "rgba(245,158,11,0.07)",
+          borderBottom: "1px solid rgba(245,158,11,0.15)",
+          padding: "8px 24px",
+          fontSize: 11, color: "#92400e",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          fontFamily: "'Inter', sans-serif",
+        }}>
+          <span style={{ color: "#d97706" }}>
+            Demo mode — simulated data.{" "}
+            <a href="https://github.com/Aprameya05/neuroflow" style={{ color: "#f59e0b", fontWeight: 600 }}>
+              Install the Chrome extension
+            </a>{" "}
+            to see your real cognitive load.
           </span>
-          <span style={{ color:"#a16207" }}>Live data replaces this automatically when extension connects.</span>
+          <span style={{ color: "#78350f", fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}>
+            LIVE DATA AUTO-CONNECTS
+          </span>
         </div>
       )}
 
-      <main style={{ maxWidth:1100, margin:"0 auto", padding:24 }}>
-        {/* ── Live Monitor ── */}
+      {/* ── Main ── */}
+      <main style={{ maxWidth: 1280, margin: "0 auto", padding: "24px 24px 40px" }}>
+
+        {/* ── Monitor View ── */}
         {view === "monitor" && (
           <>
-            <div style={{ display:"grid", gridTemplateColumns:"210px 1fr", gap:18, marginBottom:18 }}>
-              <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:20, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
-                <p style={{ margin:0, fontSize:11, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.05em" }}>Current load</p>
-                <LoadGauge load={currentLoad} size={158} />
+            {/* Row 1: Gauge + stat cards */}
+            <div style={{ display: "grid", gridTemplateColumns: "240px 1fr", gap: 16, marginBottom: 16 }}>
+              {/* Gauge */}
+              <GlowCard style={{
+                padding: "20px 16px 14px",
+                display: "flex", flexDirection: "column", alignItems: "center",
+                border: currentLoad !== null
+                  ? `1px solid ${loadColorRgba(cl, 0.25)}`
+                  : "1px solid rgba(255,255,255,0.07)",
+                boxShadow: currentLoad !== null ? `0 0 30px ${loadColorRgba(cl, 0.08)}` : "none",
+                transition: "border 0.5s ease, box-shadow 0.5s ease",
+              }}>
+                <div style={{
+                  fontSize: 9, fontWeight: 700, color: "#334155",
+                  textTransform: "uppercase", letterSpacing: "0.1em",
+                  fontFamily: "'JetBrains Mono', monospace", marginBottom: 8,
+                }}>
+                  Cognitive Load
+                </div>
+                <LoadGauge load={currentLoad} size={210} />
+              </GlowCard>
+
+              {/* Stat cards */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: "1fr 1fr", gap: 12 }}>
+                <StatCard
+                  label="Estimates received"
+                  value={estimates.length.toLocaleString()}
+                  color="#6366f1"
+                />
+                <StatCard
+                  label="Session avg"
+                  value={avg !== null ? `${Math.round(avg * 100)}%` : "—"}
+                  color={avg !== null ? loadColor(avg) : "#334155"}
+                  glow={avg !== null && avg >= 0.65}
+                />
+                <StatCard
+                  label="Peak load"
+                  value={peak !== null ? `${Math.round(peak * 100)}%` : "—"}
+                  color={peak !== null ? loadColor(peak) : "#334155"}
+                  glow={peak !== null && peak >= 0.65}
+                />
+                <StatCard
+                  label="Current state"
+                  value={currentLoad !== null
+                    ? cl < 0.21 ? "Rich" : cl < 0.35 ? "Normal" : cl < 0.65 ? "Reduced" : "Minimal"
+                    : "—"
+                  }
+                  color={currentLoad !== null ? clColor : "#334155"}
+                  glow={currentLoad !== null && cl >= 0.65}
+                />
+                <StatCard
+                  label="Active for"
+                  value={estimates.length > 0
+                    ? (() => {
+                        const s = Math.floor((Date.now() - estimates[0].ts) / 1000);
+                        return s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
+                      })()
+                    : "—"
+                  }
+                  color="#94a3b8"
+                />
+                <StatCard
+                  label="Model type"
+                  value="HEURISTIC"
+                  color="#6366f1"
+                />
               </div>
-              <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:16 }}>
-                <StatCard label="Estimates received" value={estimates.length.toLocaleString()} />
-                <StatCard label="Session avg" value={avg !== null ? `${Math.round(avg*100)}%` : "—"} />
-                <StatCard label="Peak load" value={peak !== null ? `${Math.round(peak*100)}%` : "—"} />
-              </div>
-              <UIStateBadge load={currentLoad} />
             </div>
 
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 280px", gap:18 }}>
-              <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"18px 22px" }}>
-                <p style={{ margin:"0 0 14px", fontSize:13, fontWeight:500, color:"#374151" }}>Load over time</p>
+            {/* Row 2: Timeline + Signal breakdown */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: 16, marginBottom: 16 }}>
+              <GlowCard style={{ padding: "18px 20px" }}>
+                <CardHeader title="Load over time" sub="Timeline" />
                 {estimates.length === 0
-                  ? <div style={{ height:220, display:"flex", alignItems:"center", justifyContent:"center", color:"#9ca3af", fontSize:13 }}>Waiting for signal data…</div>
-                  : <LoadTimeline estimates={estimates} />}
-              </div>
-              <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"18px 22px" }}>
-                <p style={{ margin:"0 0 14px", fontSize:13, fontWeight:500, color:"#374151" }}>Dominant signals</p>
+                  ? <div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: "#1e293b", fontSize: 12, fontFamily: "'JetBrains Mono', monospace" }}>
+                      waiting for signal data…
+                    </div>
+                  : <LoadTimeline estimates={estimates} />
+                }
+              </GlowCard>
+
+              <GlowCard style={{ padding: "18px 20px" }}>
+                <CardHeader title="Dominant signals" sub="Breakdown" />
                 {estimates.length < 5
-                  ? <p style={{ fontSize:13, color:"#9ca3af" }}>Collecting…</p>
-                  : <SignalBreakdown estimates={estimates} />}
-              </div>
+                  ? <div style={{ color: "#334155", fontSize: 12, fontFamily: "'JetBrains Mono', monospace" }}>
+                      collecting…
+                    </div>
+                  : <SignalBreakdown estimates={estimates} currentLoad={cl} />
+                }
+              </GlowCard>
             </div>
 
-            <div style={{ marginTop:18 }}>
-              <EstimateLog estimates={estimates} />
+            {/* Row 3: State distribution + Session stats + Signal matrix */}
+            <div style={{ display: "grid", gridTemplateColumns: "280px 1fr 1fr", gap: 16, marginBottom: 16 }}>
+              <GlowCard style={{ padding: "18px 20px" }}>
+                <CardHeader title="UI state distribution" sub="States" />
+                <StateDistribution estimates={estimates} />
+              </GlowCard>
+
+              <GlowCard style={{ padding: "18px 20px" }}>
+                <CardHeader title="Session metrics" sub="Stats" />
+                <SessionStats estimates={estimates} currentLoad={currentLoad} />
+              </GlowCard>
+
+              <GlowCard style={{ padding: "18px 20px" }}>
+                <CardHeader title="Signal activity heatmap" sub="Matrix" />
+                <SignalMatrix estimates={estimates} />
+              </GlowCard>
             </div>
+
+            {/* Row 4: Live log */}
+            <EstimateLog estimates={estimates} />
           </>
         )}
 
-        {/* ── Calibration ── */}
+        {/* ── Calibration View ── */}
         {view === "calibration" && (
-          <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"28px 32px" }}>
+          <GlowCard style={{ padding: "32px 40px" }}>
             <CalibrationFlow userId={sessionId} />
-          </div>
+          </GlowCard>
         )}
 
-        {/* ── About ── */}
+        {/* ── About View ── */}
         {view === "about" && (
-          <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"32px 40px", maxWidth:720 }}>
-            <h2 style={{ margin:"0 0 12px", color:"#111827", fontSize:22 }}>About NeuroFlow</h2>
-            <p style={{ color:"#4b5563", lineHeight:1.7, marginBottom:16 }}>
-              NeuroFlow is a real-time cognitive load adaptive interface system.
-              It infers cognitive load from behavioral signals — keystroke rhythm,
-              mouse movement entropy, error rate, pause patterns — and dynamically
-              adapts interface complexity in response. No EEG. No wearables. No
-              physiological sensors.
-            </p>
-            <p style={{ color:"#4b5563", lineHeight:1.7, marginBottom:16 }}>
-              This is a CHI 2026 target research project.
-              The system trains a bidirectional LSTM on labeled calibration data
-              to personalise the load model for each user.
-            </p>
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:24 }}>
+          <div style={{ maxWidth: 760 }}>
+            {/* Hero */}
+            <div style={{
+              marginBottom: 24,
+              padding: "36px 40px",
+              background: "rgba(10,13,20,0.85)",
+              border: "1px solid rgba(255,255,255,0.07)",
+              borderRadius: 18,
+              position: "relative",
+              overflow: "hidden",
+            }}>
+              <div style={{
+                position: "absolute", inset: 0,
+                background: "radial-gradient(circle at 80% 20%, rgba(99,102,241,0.08) 0%, transparent 60%)",
+                pointerEvents: "none",
+              }} />
+              <div style={{
+                fontSize: 10, fontWeight: 700, color: "#6366f1",
+                letterSpacing: "0.12em", textTransform: "uppercase",
+                fontFamily: "'JetBrains Mono', monospace", marginBottom: 10,
+              }}>
+                CHI 2026 · Research Preview
+              </div>
+              <h1 style={{ margin: "0 0 12px", fontSize: 28, fontWeight: 800, color: "#f8fafc", lineHeight: 1.2 }}>
+                Cognitive Load<br />Adaptive Interfaces
+              </h1>
+              <p style={{ color: "#64748b", lineHeight: 1.7, margin: "0 0 20px", maxWidth: 520, fontSize: 14 }}>
+                NeuroFlow infers cognitive load from behavioral signals — keystroke rhythm,
+                mouse entropy, error rate, pause patterns — and dynamically adapts interface
+                complexity. No EEG. No wearables. No physiological sensors.
+              </p>
+              <div style={{ display: "flex", gap: 10 }}>
+                {[
+                  { href: "https://github.com/Aprameya05/neuroflow", label: "GitHub →", bg: "#f8fafc", color: "#0f172a" },
+                  { href: "https://neuroflow-editor.pages.dev", label: "Try editor →", bg: "#6366f1", color: "#fff" },
+                  { href: "https://neuroflow-backend-r6rs.onrender.com/docs", label: "API docs →", bg: "transparent", color: "#6366f1", border: "1px solid rgba(99,102,241,0.3)" },
+                ].map(link => (
+                  <a key={link.label} href={link.href} target="_blank" rel="noreferrer" style={{
+                    padding: "9px 20px",
+                    background: link.bg,
+                    color: link.color,
+                    border: link.border ?? "none",
+                    borderRadius: 8,
+                    textDecoration: "none",
+                    fontSize: 13, fontWeight: 600,
+                    transition: "opacity 0.15s ease",
+                  }}>
+                    {link.label}
+                  </a>
+                ))}
+              </div>
+            </div>
+
+            {/* Stack */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
               {[
-                { label:"Backend", value:"FastAPI + WebSocket on Render" },
-                { label:"ML model", value:"BiLSTM (ONNX export)" },
-                { label:"SDK", value:"@neuroflow/sdk (TypeScript)" },
-                { label:"Target conference", value:"CHI 2026" },
+                { label: "Backend",     value: "FastAPI + WebSocket",  sub: "Render · /health",   icon: "⚙" },
+                { label: "ML Model",    value: "BiLSTM (ONNX)",        sub: "PyTorch trained",     icon: "🧠" },
+                { label: "SDK",         value: "@neuroflow/sdk",        sub: "TypeScript · npm",    icon: "📦" },
+                { label: "Signals",     value: "9 behavioral",         sub: "100ms sample rate",   icon: "📡" },
+                { label: "Extension",   value: "Chrome MV3",           sub: "WebSocket streaming", icon: "🔌" },
+                { label: "Target",      value: "CHI 2026",             sub: "N=20 within-subjects",icon: "🎯" },
               ].map(item => (
-                <div key={item.label} style={{ background:"#f9fafb", borderRadius:8, padding:"12px 16px" }}>
-                  <p style={{ margin:"0 0 4px", fontSize:11, color:"#9ca3af", textTransform:"uppercase", letterSpacing:"0.05em" }}>{item.label}</p>
-                  <p style={{ margin:0, fontSize:14, fontWeight:500, color:"#111827" }}>{item.value}</p>
-                </div>
+                <GlowCard key={item.label} style={{ padding: "16px 18px", display: "flex", gap: 14 }}>
+                  <div style={{ fontSize: 22, flexShrink: 0, lineHeight: 1 }}>{item.icon}</div>
+                  <div>
+                    <div style={{ fontSize: 9, color: "#334155", textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>
+                      {item.label}
+                    </div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc", marginBottom: 2 }}>{item.value}</div>
+                    <div style={{ fontSize: 11, color: "#475569" }}>{item.sub}</div>
+                  </div>
+                </GlowCard>
               ))}
             </div>
-            <div style={{ display:"flex", gap:12 }}>
-              <a href="https://github.com/Aprameya05/neuroflow" target="_blank" rel="noreferrer"
-                style={{ padding:"8px 18px", background:"#111827", color:"#fff", borderRadius:6, textDecoration:"none", fontSize:13, fontWeight:500 }}>
-                GitHub →
-              </a>
-              <a href="https://neuroflow-editor.pages.dev" target="_blank" rel="noreferrer"
-                style={{ padding:"8px 18px", background:"#6366f1", color:"#fff", borderRadius:6, textDecoration:"none", fontSize:13, fontWeight:500 }}>
-                Try the adaptive editor →
-              </a>
-              <a href="https://neuroflow-backend-r6rs.onrender.com/docs" target="_blank" rel="noreferrer"
-                style={{ padding:"8px 18px", background:"#fff", color:"#374151", border:"1px solid #e5e7eb", borderRadius:6, textDecoration:"none", fontSize:13, fontWeight:500 }}>
-                API docs →
-              </a>
-            </div>
+
+            {/* Research pipeline */}
+            <GlowCard style={{ padding: "20px 24px" }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em", fontFamily: "'JetBrains Mono', monospace", marginBottom: 16 }}>
+                Research Pipeline
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+                {[
+                  { step: "01", title: "Calibration",       desc: "N-back + NASA-TLX ground truth labels", done: true },
+                  { step: "02", title: "LSTM Training",     desc: "BiLSTM on A100 (50hr budget)",          done: false },
+                  { step: "03", title: "ONNX Deployment",   desc: "Replace heuristic stub in backend",     done: false },
+                  { step: "04", title: "User Study",        desc: "N=20 within-subjects, counterbalanced", done: false },
+                  { step: "05", title: "Paper Submission",  desc: "CHI 2026 deadline",                     done: false },
+                  { step: "06", title: "Open Source",       desc: "@neuroflow/sdk on npm, dataset release",done: false },
+                ].map((item, i, arr) => (
+                  <div key={item.step} style={{ display: "flex", gap: 16, position: "relative" }}>
+                    {/* Vertical line */}
+                    {i < arr.length - 1 && (
+                      <div style={{
+                        position: "absolute",
+                        left: 15, top: 28,
+                        width: 1, height: "calc(100% - 14px)",
+                        background: item.done ? "rgba(99,102,241,0.4)" : "rgba(255,255,255,0.05)",
+                      }} />
+                    )}
+                    <div style={{
+                      width: 30, height: 30, borderRadius: "50%", flexShrink: 0,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      background: item.done ? "rgba(99,102,241,0.2)" : "rgba(255,255,255,0.04)",
+                      border: `1px solid ${item.done ? "rgba(99,102,241,0.5)" : "rgba(255,255,255,0.08)"}`,
+                      fontSize: 9, fontWeight: 700,
+                      color: item.done ? "#a5b4fc" : "#334155",
+                      fontFamily: "'JetBrains Mono', monospace",
+                      zIndex: 1,
+                    }}>
+                      {item.done ? "✓" : item.step}
+                    </div>
+                    <div style={{ paddingTop: 6, paddingBottom: 18 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: item.done ? "#f8fafc" : "#64748b", marginBottom: 2 }}>
+                        {item.title}
+                      </div>
+                      <div style={{ fontSize: 11, color: "#334155" }}>{item.desc}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </GlowCard>
           </div>
         )}
       </main>
