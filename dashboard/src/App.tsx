@@ -17,6 +17,7 @@ import { FlowStreakBanner } from "./components/FlowStreakBanner";
 import { SessionReplayPlayer } from "./components/SessionReplayPlayer";
 import { loadColor, loadColorRgba } from "./utils/colors";
 import type { LoadEstimate } from "./types";
+import { NBackTask } from "./components/NBackTask";
 
 type View = "monitor" | "calibration" | "about";
 
@@ -135,6 +136,8 @@ const NAV_ITEMS = [
 export default function App() {
   const [sessionId] = useState(SESSION_ID);
   const [view, setView] = useState<View>("monitor");
+  const [nBackResult, setNBackResult] = useState<any>(null);
+
   const { estimates: liveEstimates, currentLoad: liveLoad, isConnected } = useNeuroFlowSocket(sessionId);
 
   const [showReplay, setShowReplay] = useState(false);
@@ -485,11 +488,29 @@ export default function App() {
           </>
         )}
 
-        {/* ── Calibration View ── */}
+        {/* — Calibration View — */}
         {view === "calibration" && (
-          <GlowCard style={{ padding: "32px 40px" }}>
-            <CalibrationFlow userId={sessionId} />
-          </GlowCard>
+          <>
+            <GlowCard style={{ padding: "32px 40px", marginBottom: 16 }}>
+              <CalibrationFlow userId={sessionId} />
+            </GlowCard>
+
+            <GlowCard style={{ padding: "32px 40px" }}>
+              <CardHeader
+                title="N-back working memory task"
+                sub="Cognitive load calibration"
+              />
+
+              <NBackTask
+                n={2}
+                trials={20}
+                onComplete={(result) => {
+                  setNBackResult(result);
+                  console.log("N-back calibration result:", result);
+                }}
+              />
+            </GlowCard>
+          </>
         )}
 
         {/* ── About View ── */}
