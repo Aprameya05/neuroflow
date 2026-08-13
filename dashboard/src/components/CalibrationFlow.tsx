@@ -3,11 +3,11 @@
  * Runs N-back tasks at difficulty 1, 2, 3 with NASA-TLX rating after each.
  * Submits results to the backend for LSTM training data.
  */
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { NBackTask, NBackResult } from "./NBackTask";
 import { NasaTLX, TLXScores } from "./NasaTLX";
 
-const BACKEND = "https://neuroflow-backend-r6rs.onrender.com";
+const BACKEND = "http://127.0.0.1:8000";
 
 interface CalibrationFlowProps {
   userId: string;
@@ -23,6 +23,7 @@ interface CalibrationRound {
   n: 1 | 2 | 3;
   nbackResult: NBackResult;
   tlxScores: TLXScores;
+  durationMs: number;
 }
 
 async function submitCalibration(userId: string, rounds: CalibrationRound[]) {
@@ -37,17 +38,32 @@ async function submitCalibration(userId: string, rounds: CalibrationRound[]) {
       nback_false_alarms: r.nbackResult.falseAlarms,
       nasa_tlx_overall: r.tlxScores.overallScore,
       nasa_tlx_raw: r.tlxScores,
+      duration_ms: r.durationMs,
     })),
   };
 
-  const res = await fetch(`${BACKEND}/api/calibration/submit`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  try {
+    const res = await fetch(`${BACKEND}/api/calibration/submit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
 
-  if (!res.ok) throw new Error(`Submission failed: ${res.status}`);
-  return res.json();
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(
+        `Submission failed (${res.status}): ${text || "Server returned an error"}`
+      );
+    }
+
+    return await res.json();
+  } catch (err) {
+    if (err instanceof Error) {
+      throw err;
+    }
+
+    throw new Error("Unable to submit calibration data.");
+  }
 }
 
 const N_SEQUENCE: (1 | 2 | 3)[] = [1, 2, 3];
@@ -61,6 +77,10 @@ const DIFFICULTY_LABEL: Record<number, string> = {
 export function CalibrationFlow({ userId }: CalibrationFlowProps) {
   const [phase, setPhase] = useState<Phase>({ step: "intro" });
   const [rounds, setRounds] = useState<CalibrationRound[]>([]);
+
+  const roundStartedAt = useRef<number | null>(null);
+  const lastRoundDurationMs = useRef<number>(0);
+
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -68,18 +88,33 @@ export function CalibrationFlow({ userId }: CalibrationFlowProps) {
   const totalRounds = N_SEQUENCE.length;
 
   const handleNBackComplete = (result: NBackResult) => {
-    const n = N_SEQUENCE[currentRoundIdx];
-    setPhase({ step: "tlx", n, nbackResult: result });
-  };
+  const n = N_SEQUENCE[currentRoundIdx];
+
+  if (roundStartedAt.current !== null) {
+    lastRoundDurationMs.current =
+      Math.round(performance.now() - roundStartedAt.current);
+  }
+
+  setPhase({ step: "tlx", n, nbackResult: result });
+};
 
   const handleTLXComplete = async (scores: TLXScores) => {
     const currentN = N_SEQUENCE[currentRoundIdx] as 1 | 2 | 3;
     const currentPhase = phase as { step: "tlx"; n: 1 | 2 | 3; nbackResult: NBackResult };
-    const newRounds = [...rounds, { n: currentN, nbackResult: currentPhase.nbackResult, tlxScores: scores }];
+    const newRounds = [
+      ...rounds,
+      {
+        n: currentN,
+        nbackResult: currentPhase.nbackResult,
+        tlxScores: scores,
+        durationMs: lastRoundDurationMs.current,
+      },
+    ];
     setRounds(newRounds);
 
     const nextIdx = newRounds.length;
     if (nextIdx < N_SEQUENCE.length) {
+      roundStartedAt.current = performance.now();
       setPhase({ step: "nback", n: N_SEQUENCE[nextIdx] });
     } else {
       // All rounds done — submit
@@ -94,6 +129,73 @@ export function CalibrationFlow({ userId }: CalibrationFlowProps) {
       }
     }
   };
+
+if (submitError) {
+  return (
+    <div style={{ textAlign: "center", padding: "48px 24px" }}>
+      <div style={{ fontSize: 48, marginBottom: 16 }}>⚠</div>
+
+      <h2 style={{ color: "#ef4444", marginBottom: 12 }}>
+        Submission failed
+      </h2>
+
+      <p
+        style={{
+          color: "#64748b",
+          lineHeight: 1.6,
+          maxWidth: 520,
+          margin: "0 auto 24px",
+        }}
+      >
+        Your calibration was completed, but the results could not be
+        uploaded to the backend.
+      </p>
+
+      <p
+        style={{
+          color: "#94a3b8",
+          fontSize: 12,
+          maxWidth: 520,
+          margin: "0 auto 24px",
+          fontFamily: "'JetBrains Mono', monospace",
+          wordBreak: "break-word",
+        }}
+      >
+        {submitError}
+      </p>
+
+      <button
+        onClick={async () => {
+          setSubmitting(true);
+          setSubmitError(null);
+
+          try {
+            await submitCalibration(userId, rounds);
+            setPhase({ step: "done" });
+          } catch (err) {
+            setSubmitError(
+              err instanceof Error ? err.message : "Submission failed"
+            );
+          } finally {
+            setSubmitting(false);
+          }
+        }}
+        style={{
+          padding: "12px 28px",
+          background: "#6366f1",
+          color: "#fff",
+          border: "none",
+          borderRadius: 8,
+          fontSize: 14,
+          fontWeight: 600,
+          cursor: "pointer",
+        }}
+      >
+        Retry submission
+      </button>
+    </div>
+  );
+}
 
   if (phase.step === "intro") {
     return (
@@ -127,7 +229,10 @@ export function CalibrationFlow({ userId }: CalibrationFlowProps) {
         </p>
 
         <button
-          onClick={() => setPhase({ step: "nback", n: 1 })}
+          onClick={() => {
+            roundStartedAt.current = performance.now();
+            setPhase({ step: "nback", n: 1 });
+          }}
           style={{
             padding: "14px 40px", background: "#6366f1", color: "#fff",
             border: "none", borderRadius: 8, fontSize: 15, fontWeight: 600, cursor: "pointer",
@@ -204,9 +309,7 @@ export function CalibrationFlow({ userId }: CalibrationFlowProps) {
             </div>
           ))}
         </div>
-        {submitError && (
-          <p style={{ color: "#ef4444", fontSize: 13 }}>⚠️ {submitError} — results saved locally.</p>
-        )}
+
       </div>
     );
   }
