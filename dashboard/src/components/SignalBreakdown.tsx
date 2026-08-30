@@ -38,6 +38,11 @@ export function SignalBreakdown({ estimates, currentLoad = 0.3 }: Props) {
 
   const max = sorted[0]?.[1] ?? 1;
 
+  // Which signals appeared as dominant in the last 20 estimates
+  const recentDominants = new Set(
+    estimates.slice(-20).map(e => e.dominant)
+  );
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
       {sorted.map(([signal, count], idx) => {
@@ -48,7 +53,14 @@ export function SignalBreakdown({ estimates, currentLoad = 0.3 }: Props) {
         const barColor = isDominant ? loadColor(currentLoad) : meta.color;
 
         return (
-          <div key={signal}>
+          <div
+            key={signal}
+            style={{
+              opacity: recentDominants.has(signal) ? 1 : 0.25,
+              filter: recentDominants.has(signal) ? "none" : "grayscale(60%)",
+              transition: "opacity 0.5s ease, filter 0.5s ease",
+            }}
+          >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{
