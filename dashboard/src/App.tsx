@@ -490,7 +490,47 @@ export default function App() {
 
         {/* — Calibration View — */}
         {view === "calibration" && (
-          <>
+          <div>
+            <div style={{ marginBottom: 20 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: "#6366f1",
+                  letterSpacing: "0.12em",
+                  textTransform: "uppercase",
+                  fontFamily: "'JetBrains Mono', monospace",
+                  marginBottom: 6,
+                }}
+              >
+                Ground Truth Collection
+              </div>
+
+              <h2
+                style={{
+                  margin: 0,
+                  fontSize: 22,
+                  fontWeight: 700,
+                  color: "#f8fafc",
+                }}
+              >
+                Calibration Protocol
+              </h2>
+
+              <p
+                style={{
+                  margin: "8px 0 0",
+                  color: "#475569",
+                  fontSize: 13,
+                  maxWidth: 480,
+                }}
+              >
+                Three N-back blocks with NASA-TLX self-reports. Your behavioral signals
+                during each block become labeled training examples for the cognitive
+                load model.
+              </p>
+            </div>
+
             <GlowCard style={{ padding: "32px 40px", marginBottom: 16 }}>
               <CalibrationFlow userId={sessionId} />
             </GlowCard>
@@ -510,7 +550,7 @@ export default function App() {
                 }}
               />
             </GlowCard>
-          </>
+          </div>
         )}
 
         {/* ── About View ── */}
@@ -592,7 +632,7 @@ export default function App() {
             </div>
 
             {/* Research pipeline */}
-            <GlowCard style={{ padding: "20px 24px" }}>
+            <GlowCard style={{ padding: "20px 24px", overflow: "hidden" }}>
               <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em", fontFamily: "'JetBrains Mono', monospace", marginBottom: 16 }}>
                 Research Pipeline
               </div>
