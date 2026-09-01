@@ -1,73 +1,150 @@
 /**
- * NeuroFlow SDK — Adaptive Cognitive Load Interface Runtime
+ * NeuroFlow SDK v2 — Adaptive Cognitive Load Interface Runtime
  *
- * Drop this into any web app to make it cognitively adaptive.
- * The SDK connects to the NeuroFlow backend, receives load estimates,
- * and drives CSS custom properties on :root so your UI can respond.
+ * What's new in v2
+ * ----------------
+ * Hysteresis           — prevents state flickering at boundaries. A transition
+ *                        from state A to state B requires the load to cross the
+ *                        threshold by HYSTERESIS_BAND before it is committed.
+ * Predictive adaptation — when the server forecast indicates load will cross a
+ *                        threshold within 3 s, the SDK pre-adapts, giving the UI
+ *                        time to transition smoothly before the user notices.
+ * Plugin / observer API — nf.use(plugin) lets third-party code subscribe to
+ *                        every estimate and respond with their own DOM mutations.
+ * --nf-forecast CSS var — continuously updated with the 6s-ahead predicted load.
+ * --nf-fatigue CSS var  — fatigue index from the backend.
+ * Focus-aware guard     — adaptation is suppressed when the user is in a
+ *                        critical input field (input[data-nf-critical]).
+ * Reconnect strategy    — exponential backoff (mirrors the extension).
  *
- * Quick start:
- *   const nf = new NeuroFlow({ sessionId: uid, wsUrl: 'ws://localhost:8000/ws/signal' });
+ * Quick start (unchanged)
+ * -----------------------
+ *   const nf = new NeuroFlow({ sessionId: uid, wsUrl: '...' });
  *   nf.start();
- *   nf.onLoadChange((estimate, uiState) => {
- *     console.log(`Load: ${estimate.load}, UI state: ${uiState}`);
- *   });
  *
- * CSS usage:
+ * CSS usage (new vars)
+ * --------------------
+ *   .sidebar { opacity: calc(1 - var(--nf-load) * 0.8); }
  *   [data-nf-state="minimal"] .sidebar { display: none; }
- *   .animation { transition-duration: var(--nf-animation-speed, 0.2s); }
+ *   .ai-hint { opacity: var(--nf-fatigue); }  /* show more hints when fatigued *\/
  */
 
 export interface LoadEstimate {
   type: string;
-  load: number;           // 0.0 = low cognitive load | 1.0 = overwhelmed
+  load: number;
+  raw_load?: number;
   confidence: number;
-  dominant: string;       // name of the signal that drove this estimate
+  dominant: string;
   ts: number;
   session_id: string;
+  fatigue_index?: number;
+  is_anomaly?: boolean;
+  predicted_load?: number;
+  session_pct?: number;
+  forecast?: {
+    phase: string;
+    trend: number;
+    intervention: boolean;
+    points: number[];
+    load_6s: number | null;
+  };
 }
 
-/**
- * Discrete UI states derived from continuous load score.
- * Use data-nf-state CSS attribute selectors in your stylesheet.
- *
- * rich     < 21% load — user is in deep focus, show full feature set
- * normal   < 30% load — standard interface density
- * reduced  < 65% load — simplify: hide secondary actions, reduce animations
- * minimal  > 65% load — emergency simplification: core task only
- */
 export type UIState = 'rich' | 'normal' | 'reduced' | 'minimal';
+
+export interface NeuroFlowPlugin {
+  name: string;
+  onEstimate(estimate: LoadEstimate, state: UIState): void;
+  onStateChange?(from: UIState, to: UIState, estimate: LoadEstimate): void;
+}
 
 export interface NeuroFlowConfig {
   sessionId: string;
   wsUrl: string;
-  /** Signal sampling rate (ms). Lower = more responsive, higher CPU. Default: 100 */
   sampleRateMs?: number;
-  /** smooth: drives --nf-load CSS var continuously | threshold: stepped data-nf-state only */
   adaptationMode?: 'smooth' | 'threshold';
-  /** Load thresholds for UIState transitions */
-  thresholds?: { low: number; high: number };
+  thresholds?: { rich: number; normal: number; reduced: number };
+  hysteresisMs?: number;
   onError?: (err: Error) => void;
+  /** Suppress adaptation while a [data-nf-critical] element has focus */
+  respectCriticalInputs?: boolean;
 }
 
 type LoadChangeCallback = (estimate: LoadEstimate, uiState: UIState) => void;
+
+// ─── Hysteresis state machine ────────────────────────────────────────────────
+
+const HYSTERESIS_BAND = 0.04;   // must cross threshold by this much before committing
+
+function hysteresisState(
+  current: UIState,
+  load: number,
+  thresholds: { rich: number; normal: number; reduced: number },
+): UIState {
+  const { rich, normal, reduced } = thresholds;
+
+  // Raw target state without hysteresis
+  let raw: UIState;
+  if (load < rich) raw = 'rich';
+  else if (load < normal) raw = 'normal';
+  else if (load < reduced) raw = 'reduced';
+  else raw = 'minimal';
+
+  if (raw === current) return current;
+
+  // Only commit if the load has passed the threshold by HYSTERESIS_BAND
+  const stateOrder: UIState[] = ['rich', 'normal', 'reduced', 'minimal'];
+  const currIdx = stateOrder.indexOf(current);
+  const rawIdx  = stateOrder.indexOf(raw);
+
+  if (rawIdx > currIdx) {
+    // Moving toward higher load — need to be well above the threshold
+    const boundary = rawIdx === 1 ? rich : rawIdx === 2 ? normal : reduced;
+    return load > boundary + HYSTERESIS_BAND ? raw : current;
+  } else {
+    // Moving toward lower load — need to be well below the threshold
+    const boundary = currIdx === 1 ? rich : currIdx === 2 ? normal : reduced;
+    return load < boundary - HYSTERESIS_BAND ? raw : current;
+  }
+}
+
+// ─── Main class ──────────────────────────────────────────────────────────────
 
 export class NeuroFlow {
   private ws: WebSocket | null = null;
   private collector: SignalCollector;
   private callbacks: LoadChangeCallback[] = [];
+  private plugins: NeuroFlowPlugin[] = [];
   private cfg: Required<NeuroFlowConfig>;
+
   private connected = false;
+  private reconnectDelay = 1000;
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  private currentState: UIState = 'normal';
+  private criticalFocus = false;
 
   constructor(config: NeuroFlowConfig) {
     this.cfg = {
       sampleRateMs: 100,
       adaptationMode: 'smooth',
-      thresholds: { low: 0.3, high: 0.65 },
+      thresholds: { rich: 0.21, normal: 0.35, reduced: 0.65 },
+      hysteresisMs: 2000,
       onError: console.error,
+      respectCriticalInputs: true,
       ...config,
     };
     this.collector = new SignalCollector(this.cfg.sampleRateMs);
+
+    if (this.cfg.respectCriticalInputs) {
+      document.addEventListener('focusin', (e) => {
+        const el = e.target as HTMLElement;
+        this.criticalFocus = !!el?.closest('[data-nf-critical]');
+      });
+      document.addEventListener('focusout', () => {
+        this.criticalFocus = false;
+      });
+    }
   }
 
   start(): void {
@@ -86,28 +163,34 @@ export class NeuroFlow {
     this.connected = false;
   }
 
-  /** Subscribe to load change events. Returns an unsubscribe function. */
+  /** Register a callback for every load estimate */
   onLoadChange(cb: LoadChangeCallback): () => void {
     this.callbacks.push(cb);
-    return () => {
-      this.callbacks = this.callbacks.filter((c) => c !== cb);
-    };
+    return () => { this.callbacks = this.callbacks.filter((c) => c !== cb); };
   }
 
-  /** Get the current UIState from the DOM attribute (sync, no event needed) */
-  getCurrentUIState(): UIState {
-    return (document.documentElement.getAttribute('data-nf-state') as UIState) || 'normal';
+  /** Register a plugin (receives every estimate + state changes) */
+  use(plugin: NeuroFlowPlugin): this {
+    this.plugins.push(plugin);
+    return this;
   }
+
+  getCurrentUIState(): UIState {
+    return this.currentState;
+  }
+
+  // ── Internal ──────────────────────────────────────────────────────────────
 
   private connect(): void {
     const url = `${this.cfg.wsUrl}/${this.cfg.sessionId}`;
     this.ws = new WebSocket(url);
 
     this.ws.onopen = () => {
-      this.connected = true;
+      this.connected     = true;
+      this.reconnectDelay = 1000;
     };
 
-    this.ws.onmessage = this.handleMessage.bind(this);
+    this.ws.onmessage = (event) => this.handleMessage(event);
 
     this.ws.onerror = () => {
       this.cfg.onError(new Error('NeuroFlow WebSocket error'));
@@ -115,58 +198,89 @@ export class NeuroFlow {
 
     this.ws.onclose = () => {
       this.connected = false;
-      // Auto-reconnect after 3 seconds
-      this.reconnectTimeout = setTimeout(() => this.connect(), 3000);
+      this.reconnectTimeout = setTimeout(() => {
+        this.reconnectTimeout = null;
+        this.connect();
+      }, this.reconnectDelay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 60_000);
     };
   }
 
   private handleMessage(event: MessageEvent): void {
     let estimate: LoadEstimate;
-    try {
-      estimate = JSON.parse(event.data) as LoadEstimate;
-    } catch {
+    try { estimate = JSON.parse(event.data) as LoadEstimate; } catch { return; }
+
+    if (estimate.type === 'ping') {
+      this.ws?.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
       return;
     }
     if (estimate.type !== 'load_estimate') return;
 
-    const uiState = this.computeUIState(estimate.load);
-    this.applyAdaptation(estimate.load, uiState);
-    this.callbacks.forEach((cb) => cb(estimate, uiState));
+    // Determine if we should pre-adapt based on forecast
+    let effectiveLoad = estimate.load;
+    const fc = estimate.forecast;
+    if (fc?.load_6s != null) {
+      const stateOrder: UIState[] = ['rich', 'normal', 'reduced', 'minimal'];
+      const currIdx  = stateOrder.indexOf(this.currentState);
+      const futureState = this.rawState(fc.load_6s);
+      const futureIdx = stateOrder.indexOf(futureState);
+
+      // Pre-adapt if forecast indicates a higher-load state in 6 s
+      if (futureIdx > currIdx) {
+        effectiveLoad = Math.max(effectiveLoad, fc.load_6s * 0.6 + effectiveLoad * 0.4);
+      }
+    }
+
+    const prevState    = this.currentState;
+    const nextState    = hysteresisState(prevState, effectiveLoad, this.cfg.thresholds);
+    this.currentState  = nextState;
+
+    if (!this.criticalFocus) {
+      this.applyAdaptation(estimate.load, nextState, estimate);
+    }
+
+    this.callbacks.forEach((cb) => cb(estimate, nextState));
+    this.plugins.forEach((p) => {
+      p.onEstimate(estimate, nextState);
+      if (nextState !== prevState) p.onStateChange?.(prevState, nextState, estimate);
+    });
   }
 
-  private computeUIState(load: number): UIState {
-    const { low, high } = this.cfg.thresholds;
-    if (load < low * 0.7) return 'rich';
-    if (load < low) return 'normal';
-    if (load < high) return 'reduced';
+  private rawState(load: number): UIState {
+    const { rich, normal, reduced } = this.cfg.thresholds;
+    if (load < rich) return 'rich';
+    if (load < normal) return 'normal';
+    if (load < reduced) return 'reduced';
     return 'minimal';
   }
 
-  /**
-   * Drive CSS custom properties and data attributes.
-   * Your CSS can then use:
-   *   calc(1 + (1 - var(--nf-load)) * 0.5)  — scale values with load
-   *   [data-nf-state="minimal"] .sidebar { display: none; }
-   */
-  private applyAdaptation(load: number, state: UIState): void {
+  private applyAdaptation(load: number, state: UIState, estimate: LoadEstimate): void {
     const root = document.documentElement;
 
     if (this.cfg.adaptationMode === 'smooth') {
-      root.style.setProperty('--nf-load', load.toFixed(3));
-      // density: 1.0 at zero load, 0.4 at maximum load
-      root.style.setProperty('--nf-density', (1 - load * 0.6).toFixed(3));
-      // animations slow down under high load (less distraction)
-      root.style.setProperty('--nf-animation-speed', `${(0.2 + load * 0.5).toFixed(2)}s`);
-      // opacity of non-critical secondary elements
+      root.style.setProperty('--nf-load',             load.toFixed(3));
+      root.style.setProperty('--nf-density',          (1 - load * 0.6).toFixed(3));
+      root.style.setProperty('--nf-animation-speed',  `${(0.2 + load * 0.5).toFixed(2)}s`);
       root.style.setProperty('--nf-secondary-opacity', (1 - load * 0.7).toFixed(3));
+
+      // v2 new vars
+      if (estimate.fatigue_index != null) {
+        root.style.setProperty('--nf-fatigue', estimate.fatigue_index.toFixed(3));
+      }
+      if (estimate.forecast?.load_6s != null) {
+        root.style.setProperty('--nf-forecast', estimate.forecast.load_6s.toFixed(3));
+      }
+      if (estimate.forecast?.phase) {
+        root.setAttribute('data-nf-phase', estimate.forecast.phase);
+      }
     }
 
-    // Always set the discrete state for CSS selectors
     root.setAttribute('data-nf-state', state);
   }
 }
 
 // ─── Signal Collector ────────────────────────────────────────────────────────
+// (Identical to v1; kept in-sync with extension/src/collector.js)
 
 class SignalCollector {
   private intervalId: ReturnType<typeof setInterval> | null = null;
@@ -187,20 +301,14 @@ class SignalCollector {
   }
 
   private attachListeners(): void {
-    document.addEventListener(
-      'keydown',
-      (e) => {
-        const now = Date.now();
-        if (this.lastKeyTime > 0) {
-          this.keyBuffer.push(now - this.lastKeyTime);
-        }
-        this.lastKeyTime = now;
-        this.totalKeys++;
-        this.lastActivity = now;
-        if (e.key === 'Backspace' || e.key === 'Delete') this.errorCount++;
-      },
-      true
-    );
+    document.addEventListener('keydown', (e) => {
+      const now = Date.now();
+      if (this.lastKeyTime > 0) this.keyBuffer.push(now - this.lastKeyTime);
+      this.lastKeyTime = now;
+      this.totalKeys++;
+      this.lastActivity = now;
+      if (e.key === 'Backspace' || e.key === 'Delete') this.errorCount++;
+    }, true);
 
     document.addEventListener('mousemove', (e) => {
       this.mouseTrack.push({ x: e.clientX, y: e.clientY, t: Date.now() });
@@ -223,8 +331,8 @@ class SignalCollector {
       if (document.hidden) this.tabSwitches++;
     });
 
-    document.addEventListener('copy', () => this.cpCount++);
-    document.addEventListener('paste', () => this.cpCount++);
+    document.addEventListener('copy',  () => this.cpCount++);
+    document.addEventListener('paste', () => { this.cpCount++; this.lastActivity = Date.now(); });
   }
 
   start(emit: (signal: Record<string, number>) => void): void {
@@ -232,56 +340,35 @@ class SignalCollector {
   }
 
   stop(): void {
-    if (this.intervalId !== null) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
+    if (this.intervalId !== null) { clearInterval(this.intervalId); this.intervalId = null; }
   }
 
   private flush(): Record<string, number> {
     const now = Date.now();
-
-    const ikiAvg =
-      this.keyBuffer.length > 0
-        ? this.keyBuffer.reduce((a, b) => a + b, 0) / this.keyBuffer.length
-        : 0;
-
+    const ikiAvg = this.keyBuffer.length
+      ? this.keyBuffer.reduce((a, b) => a + b, 0) / this.keyBuffer.length
+      : 0;
     const { velocity: mv, acceleration: ma } = this.computeMouseVelocity();
     const mdc = this.computeDirectionChanges();
-    const sv =
-      this.scrollVelocityBuffer.length > 0
-        ? this.scrollVelocityBuffer.reduce((a, b) => a + b, 0) / this.scrollVelocityBuffer.length
-        : 0;
+    const sv = this.scrollVelocityBuffer.length
+      ? this.scrollVelocityBuffer.reduce((a, b) => a + b, 0) / this.scrollVelocityBuffer.length
+      : 0;
     const er = this.totalKeys > 0 ? this.errorCount / this.totalKeys : 0;
     const pause = now - this.lastActivity;
 
     const snap: Record<string, number> = {
-      ts: now,
-      iki: ikiAvg,
-      mv,
-      ma,
-      mdc,
-      sv,
-      er,
-      pause,
-      ts_count: this.tabSwitches,
-      cp: this.cpCount,
+      ts: now, iki: ikiAvg, mv, ma, mdc, sv, er, pause,
+      ts_count: this.tabSwitches, cp: this.cpCount,
     };
 
-    // Reset accumulators
-    this.keyBuffer = [];
-    this.tabSwitches = 0;
-    this.cpCount = 0;
-    this.errorCount = 0;
-    this.totalKeys = 0;
-    this.scrollVelocityBuffer = [];
+    this.keyBuffer = []; this.tabSwitches = 0; this.cpCount = 0;
+    this.errorCount = 0; this.totalKeys = 0; this.scrollVelocityBuffer = [];
 
     return snap;
   }
 
   private computeMouseVelocity(): { velocity: number; acceleration: number } {
     if (this.mouseTrack.length < 2) return { velocity: 0, acceleration: 0 };
-
     const velocities: number[] = [];
     for (let i = 1; i < this.mouseTrack.length; i++) {
       const dx = this.mouseTrack[i].x - this.mouseTrack[i - 1].x;
@@ -289,30 +376,21 @@ class SignalCollector {
       const dt = this.mouseTrack[i].t - this.mouseTrack[i - 1].t;
       if (dt > 0) velocities.push(Math.sqrt(dx * dx + dy * dy) / dt);
     }
-
-    if (velocities.length === 0) return { velocity: 0, acceleration: 0 };
-
+    if (!velocities.length) return { velocity: 0, acceleration: 0 };
     const v = velocities.reduce((a, b) => a + b, 0) / velocities.length;
-    const acc =
-      velocities.length > 1
-        ? Math.abs(velocities[velocities.length - 1] - velocities[0])
-        : 0;
-
+    const acc = velocities.length > 1 ? Math.abs(velocities[velocities.length - 1] - velocities[0]) : 0;
     return { velocity: v, acceleration: acc };
   }
 
   private computeDirectionChanges(): number {
     if (this.mouseTrack.length < 3) return 0;
-    let changes = 0;
-    let prevAngle: number | null = null;
+    let changes = 0, prevAngle: number | null = null;
     for (let i = 1; i < this.mouseTrack.length; i++) {
       const dx = this.mouseTrack[i].x - this.mouseTrack[i - 1].x;
       const dy = this.mouseTrack[i].y - this.mouseTrack[i - 1].y;
       if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
       const angle = Math.atan2(dy, dx);
-      if (prevAngle !== null && Math.abs(angle - prevAngle) > Math.PI / 4) {
-        changes++;
-      }
+      if (prevAngle !== null && Math.abs(angle - prevAngle) > Math.PI / 4) changes++;
       prevAngle = angle;
     }
     return changes;
