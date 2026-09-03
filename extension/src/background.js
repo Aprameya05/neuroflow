@@ -25,6 +25,9 @@ let reconnectTimer  = null;
 let offlineBuffer   = [];     // signals queued while disconnected
 const MAX_BUFFER    = 500;    // drop oldest when buffer is full
 
+const tabSignals = {};                 // tabId → { lastActive: number, signals: [] }
+const TAB_WEIGHT_HALFLIFE = 30_000;    // 30 s: older tabs contribute less
+
 // ── Initialise session ID ────────────────────────────────────────────────────
 
 chrome.storage.local.get(["nf_session_id"], (res) => {
@@ -111,11 +114,106 @@ function setBadge(text, color) {
   chrome.action.setBadgeBackgroundColor({ color });
 }
 
+function mergeTabSignals() {
+  const entries = Object.entries(tabSignals);
+
+  if (entries.length === 0) return null;
+
+  const now = Date.now();
+
+  // Get the latest signal from each tab and calculate its recency weight.
+  const weighted = entries
+    .map(([tabId, state]) => {
+      const latest = state.signals[state.signals.length - 1];
+
+      if (!latest) return null;
+
+      const elapsed = Math.max(0, now - state.lastActive);
+      const weight = Math.exp(-elapsed / TAB_WEIGHT_HALFLIFE);
+
+      return {
+        tabId: Number(tabId),
+        state,
+        signal: latest,
+        weight,
+      };
+    })
+    .filter(Boolean);
+
+  if (weighted.length === 0) return null;
+
+  const totalWeight = weighted.reduce(
+    (sum, item) => sum + item.weight,
+    0
+  );
+
+  // The most recently active tab determines the URL.
+  const mostRecent = [...weighted].sort(
+    (a, b) => b.state.lastActive - a.state.lastActive
+  )[0];
+
+  const merged = {
+    ...mostRecent.signal,
+    url: mostRecent.signal.url,
+  };
+
+  // Find all numeric fields across the signals.
+  const numericKeys = new Set();
+
+  for (const item of weighted) {
+    for (const [key, value] of Object.entries(item.signal)) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        numericKeys.add(key);
+      }
+    }
+  }
+
+  // Calculate a recency-weighted average for numeric fields.
+  for (const key of numericKeys) {
+    let weightedSum = 0;
+
+    for (const item of weighted) {
+      const value = item.signal[key];
+
+      if (typeof value === "number" && Number.isFinite(value)) {
+        weightedSum += value * item.weight;
+      }
+    }
+
+    merged[key] = totalWeight > 0
+      ? weightedSum / totalWeight
+      : mostRecent.signal[key];
+  }
+
+  // Tell the caller how many tabs contributed.
+  merged.tab_count = weighted.length;
+
+  return merged;
+}
+
 // ── Message handler ──────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "SIGNAL") {
     const payload = message.payload;
+    const tabId = _sender.tab?.id;
+
+    // Store a short signal history for each tab
+    if (tabId != null) {
+      if (!tabSignals[tabId]) {
+        tabSignals[tabId] = {
+          lastActive: Date.now(),
+          signals: [],
+        };
+      }
+
+      tabSignals[tabId].lastActive = Date.now();
+      tabSignals[tabId].signals.push(payload);
+
+      if (tabSignals[tabId].signals.length > 50) {
+        tabSignals[tabId].signals.shift();
+      }
+    }
 
     if (ws?.readyState === WebSocket.OPEN) {
       try {
@@ -137,6 +235,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     });
   }
 
+  if (message.type === "GET_MERGED_SIGNAL") {
+    sendResponse({
+      signal: mergeTabSignals(),
+      tabCount: Object.keys(tabSignals).length,
+    });
+  }
+
   if (message.type === "RESET_SESSION") {
     sessionId = crypto.randomUUID();
     chrome.storage.local.set({ nf_session_id: sessionId });
@@ -154,3 +259,7 @@ function bufferSignal(payload) {
   offlineBuffer.push(payload);
   setBadge(`${offlineBuffer.length}`, "#6b7280");
 }
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  delete tabSignals[tabId];
+});

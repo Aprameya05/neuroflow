@@ -17,6 +17,17 @@
     .signal-row span:last-child { color: #111; font-weight: 500; }
     .status-row { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #9ca3af; margin-top: 14px; }
     .dot { width: 7px; height: 7px; border-radius: 50%; }
+    .anomaly-banner {
+      display: none;
+      margin-bottom: 12px;
+      padding: 9px 10px;
+      border-radius: 8px;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      color: #b91c1c;
+      font-size: 11px;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -28,6 +39,10 @@
     </div>
   </div>
   <div class="body">
+    <div class="anomaly-banner" id="anomaly-banner">
+      ⚠ Anomalous cognitive-load pattern detected
+    </div>
+
     <div class="gauge-row">
       <div class="load-number" id="load-number">—</div>
       <div class="state-badge" id="state-badge">Waiting…</div>
@@ -37,6 +52,22 @@
       <div class="dot" id="status-dot" style="background:#9ca3af"></div>
       <span id="status-text">Connecting…</span>
     </div>
+
+    <button id="reset-session" style="
+      width: 100%;
+      margin-top: 12px;
+      padding: 7px 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 7px;
+      background: #fff;
+      color: #6b7280;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    ">
+      RESET SESSION
+    </button>
+
   </div>
   <script src="src/popup.js"></script>
 </body>

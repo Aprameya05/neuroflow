@@ -18,6 +18,7 @@ import { SessionReplayPlayer } from "./components/SessionReplayPlayer";
 import { loadColor, loadColorRgba } from "./utils/colors";
 import type { LoadEstimate } from "./types";
 import { NBackTask } from "./components/NBackTask";
+import { FatigueAlert } from "./components/FatigueAlert";
 
 type View = "monitor" | "calibration" | "about";
 
@@ -143,6 +144,9 @@ export default function App() {
   const [showReplay, setShowReplay] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
   const [demoEstimates, setDemoEstimates] = useState<LoadEstimate[]>([]);
+  const [fatigueIndex, setFatigueIndex] = useState(0);
+  const [fatigueHistory, setFatigueHistory] = useState<number[]>([]);
+  const sessionStartRef = useRef<number | null>(null);
   const demoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const demoInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -186,6 +190,36 @@ export default function App() {
   const estimates = isConnected ? liveEstimates : demoEstimates;
   const currentLoad = isConnected ? liveLoad
     : demoEstimates.length > 0 ? demoEstimates[demoEstimates.length - 1].load : null;
+
+  useEffect(() => {
+    if (currentLoad === null) return;
+
+    if (sessionStartRef.current === null) {
+      sessionStartRef.current = Date.now();
+  }
+
+  // Use recent load to represent sustained cognitive demand.
+  const recentLoads = estimates.slice(-30).map((estimate) => estimate.load);
+  const averageLoad = recentLoads.length > 0
+    ? recentLoads.reduce((sum, load) => sum + load, 0) / recentLoads.length
+    : currentLoad;
+
+  // Longer sessions contribute gradually to fatigue.
+  const elapsedMinutes =
+    (Date.now() - sessionStartRef.current) / 60000;
+  const durationFactor = Math.min(elapsedMinutes / 30, 1);
+
+  const nextFatigue = Math.min(
+    1,
+    averageLoad * 0.75 + durationFactor * 0.25
+  );
+
+  setFatigueIndex(nextFatigue);
+  setFatigueHistory((previous) => [
+    ...previous,
+    nextFatigue,
+  ].slice(-30));
+}, [currentLoad, estimates]);
 
   const avg = estimates.length > 0 ? estimates.reduce((s, e) => s + e.load, 0) / estimates.length : null;
   const peak = estimates.length > 0 ? Math.max(...estimates.map(e => e.load)) : null;
@@ -360,6 +394,11 @@ export default function App() {
 
       {/* ── Main ── */}
       <main style={{ maxWidth: 1280, margin: "0 auto", padding: "24px 24px 40px" }}>
+
+        <FatigueAlert
+          fatigueIndex={fatigueIndex}
+          history={fatigueHistory}
+        />
 
         {/* ── Monitor View ── */}
         {view === "monitor" && (
