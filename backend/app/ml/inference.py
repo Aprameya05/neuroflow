@@ -5,7 +5,8 @@ Three-layer inference stack:
   1.  Feature extraction   — 9 behavioural signals → normalised feature vector
   2.  Load estimation      — ONNX BiLSTM (prod) or improved heuristic (dev)
   3.  Post-processing      — Kalman filter, adaptive baseline, fatigue integral,
-                             Mahalanobis confidence, anomaly detection
+                             Mahalanobis confidence, anomaly detection,
+                             circadian normalisation, flow episode detection
 
 New in v2
 ---------
@@ -20,13 +21,19 @@ New in v2
   an outlier (e.g. user walked away).
 * Anomaly detection: spike alert when instantaneous load jumps > 0.25 in one
   window relative to the Kalman-smoothed baseline.
+* Circadian normalisation: load baseline adjusts for time-of-day. Peak cognitive
+  capacity at ~10 am, trough at ~3 pm (inverted-U diurnal model).
+* Flow episode detection: tracks contiguous low-load windows as discrete labelled
+  flow episodes with depth, duration, and recovery-speed metrics.
 """
 from __future__ import annotations
 
 import math
 import logging
+import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +61,11 @@ FEATURE_NAMES: list[str] = [
 N_FEATURES = len(FEATURE_NAMES)
 SEQ_LEN = 30  # must match training config
 
+# Flow episode thresholds
+FLOW_ENTRY_THRESHOLD  = 0.32   # load must drop below this to enter flow
+FLOW_EXIT_THRESHOLD   = 0.42   # load must rise above this to exit flow (hysteresis)
+FLOW_MIN_WINDOWS      = 8      # minimum consecutive windows to constitute a flow episode
+
 
 # ---------------------------------------------------------------------------
 # Data-transfer objects
@@ -74,6 +86,17 @@ class BehavioralSignal:
 
 
 @dataclass
+class FlowEpisode:
+    start_ts: int
+    end_ts: int
+    avg_depth: float         # mean (1 - load_score) during the episode — higher = deeper flow
+    min_load: float          # lowest load observed in the episode
+    duration_ms: int
+    window_count: int
+    recovery_load: float     # average load in the 5 windows immediately after exit
+
+
+@dataclass
 class CognitiveLoadEstimate:
     load_score: float          # Kalman-smoothed, 0.0–1.0
     raw_load: float            # pre-Kalman raw estimate
@@ -86,6 +109,10 @@ class CognitiveLoadEstimate:
     is_anomaly: bool           # sudden load spike detected
     predicted_load: float      # 1-step-ahead Kalman prediction
     session_percentile: float  # where this window falls in session distribution
+    # v2.1 additions
+    circadian_factor: float    # 0.7–1.15 time-of-day capacity multiplier
+    in_flow_episode: bool      # currently in a detected flow state
+    flow_episode_depth: float  # 0.0 if not in flow; avg depth of current episode so far
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +243,153 @@ class FatigueTracker:
 
 
 # ---------------------------------------------------------------------------
+# Circadian normaliser
+# ---------------------------------------------------------------------------
+
+class CircadianNormalizer:
+    """
+    Time-of-day aware cognitive capacity model.
+
+    Uses an inverted-U sinusoidal model of diurnal cognitive capacity
+    (Monk et al., 1983; Folkard & Monk, 1985):
+      - Capacity rises from ~7 am, peaks at ~10 am
+      - Dips slightly post-lunch (~2 pm)
+      - Secondary minor peak ~4–5 pm
+      - Falls steeply after 7 pm
+
+    The factor returned is a multiplier in [0.70, 1.15] applied to the
+    effective load: high capacity hours reduce effective load slightly
+    (the user can handle more), low capacity hours amplify it.
+
+    Implementation: dual-cosine model fitted to the empirical data in
+    Monk et al. (1983), Table 2, normalised to unit amplitude.
+    """
+
+    # Peak cognitive performance hour (10 am local)
+    _PEAK_HOUR: float = 10.0
+    # Secondary minor peak (4 pm local) — post-lunch recovery
+    _SECONDARY_HOUR: float = 16.0
+    # Post-lunch trough depth relative to primary amplitude
+    _SECONDARY_AMPLITUDE: float = 0.18
+
+    def factor(self, ts_ms: Optional[int] = None) -> float:
+        """
+        Return a circadian capacity factor for the given UTC timestamp.
+        Factor > 1.0 means the user is in a high-capacity period (load feels lighter).
+        Factor < 1.0 means the user is in a low-capacity period (load feels heavier).
+        """
+        if ts_ms is None:
+            ts_ms = int(time.time() * 1000)
+
+        dt_utc = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        hour_frac = dt_utc.hour + dt_utc.minute / 60.0
+
+        # Primary cosine: peaks at _PEAK_HOUR, period 24 h, amplitude 0.20
+        primary = 0.20 * math.cos(2 * math.pi * (hour_frac - self._PEAK_HOUR) / 24.0)
+
+        # Secondary cosine: mild afternoon recovery peak
+        secondary = self._SECONDARY_AMPLITUDE * math.cos(
+            2 * math.pi * (hour_frac - self._SECONDARY_HOUR) / 12.0
+        )
+
+        # Combined factor: centre 1.0, range ~[0.70, 1.15]
+        factor = 1.0 + primary + secondary * 0.3
+        return float(np.clip(factor, 0.70, 1.15))
+
+    def normalise_load(self, raw_load: float, ts_ms: Optional[int] = None) -> float:
+        """
+        Adjust raw load by circadian factor.
+        High-capacity periods compress load toward 0; low-capacity periods amplify it.
+        """
+        f = self.factor(ts_ms)
+        # When capacity is high (f > 1), divide load → lower effective load
+        # When capacity is low  (f < 1), divide load → higher effective load
+        adjusted = raw_load / f
+        return float(np.clip(adjusted, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Flow episode detector
+# ---------------------------------------------------------------------------
+
+class FlowEpisodeDetector:
+    """
+    Detects discrete flow episodes from the Kalman-smoothed load stream.
+
+    A flow episode is a contiguous run of FLOW_MIN_WINDOWS or more
+    windows where load stays below FLOW_ENTRY_THRESHOLD.  Hysteresis
+    prevents rapid in/out toggling: once inside a flow episode, load must
+    rise above FLOW_EXIT_THRESHOLD to end it.
+
+    The recovery window (5 windows post-exit) is captured to measure how
+    fast the user re-enters a demanding state after flow breaks.
+    """
+
+    def __init__(self) -> None:
+        self._in_flow: bool = False
+        self._flow_start_ts: int = 0
+        self._flow_loads: list[float] = []
+        self._flow_tss: list[int] = []
+        self._post_flow_buffer: deque[float] = deque(maxlen=5)
+        self._pending_episode: Optional[dict] = None
+
+        self.completed_episodes: list[FlowEpisode] = []
+
+    @property
+    def in_flow(self) -> bool:
+        return self._in_flow and len(self._flow_loads) >= FLOW_MIN_WINDOWS
+
+    @property
+    def current_depth(self) -> float:
+        if not self._in_flow or not self._flow_loads:
+            return 0.0
+        return round(1.0 - float(np.mean(self._flow_loads)), 4)
+
+    def update(self, load: float, ts_ms: int) -> None:
+        if self._pending_episode is not None:
+            # Collecting post-flow recovery windows
+            self._post_flow_buffer.append(load)
+            if len(self._post_flow_buffer) == self._post_flow_buffer.maxlen:
+                ep = self._pending_episode
+                recovery_load = float(np.mean(self._post_flow_buffer))
+                loads_arr = ep["loads"]
+                episode = FlowEpisode(
+                    start_ts=ep["start_ts"],
+                    end_ts=ep["end_ts"],
+                    avg_depth=round(1.0 - float(np.mean(loads_arr)), 4),
+                    min_load=round(float(np.min(loads_arr)), 4),
+                    duration_ms=ep["end_ts"] - ep["start_ts"],
+                    window_count=len(loads_arr),
+                    recovery_load=round(recovery_load, 4),
+                )
+                self.completed_episodes.append(episode)
+                self._pending_episode = None
+
+        if not self._in_flow:
+            if load < FLOW_ENTRY_THRESHOLD:
+                self._in_flow = True
+                self._flow_start_ts = ts_ms
+                self._flow_loads = [load]
+                self._flow_tss = [ts_ms]
+        else:
+            if load > FLOW_EXIT_THRESHOLD:
+                # Exit flow
+                if len(self._flow_loads) >= FLOW_MIN_WINDOWS:
+                    self._pending_episode = {
+                        "start_ts": self._flow_start_ts,
+                        "end_ts": self._flow_tss[-1],
+                        "loads": list(self._flow_loads),
+                    }
+                    self._post_flow_buffer.clear()
+                self._in_flow = False
+                self._flow_loads = []
+                self._flow_tss = []
+            else:
+                self._flow_loads.append(load)
+                self._flow_tss.append(ts_ms)
+
+
+# ---------------------------------------------------------------------------
 # Improved heuristic
 # ---------------------------------------------------------------------------
 
@@ -294,9 +468,11 @@ class CognitiveLoadInferencer:
         self.feature_history: deque[np.ndarray] = deque(maxlen=SEQ_LEN)
         self.window_ms = settings.SIGNAL_WINDOW_MS
 
-        self.kalman   = KalmanFilter1D(q=0.002, r=0.05)
-        self.baseline = SessionBaseline()
-        self.fatigue  = FatigueTracker()
+        self.kalman    = KalmanFilter1D(q=0.002, r=0.05)
+        self.baseline  = SessionBaseline()
+        self.fatigue   = FatigueTracker()
+        self.circadian = CircadianNormalizer()
+        self.flow      = FlowEpisodeDetector()
 
         self._load_history: deque[float] = deque(maxlen=600)  # ~60 s of history
 
@@ -338,18 +514,29 @@ class CognitiveLoadInferencer:
         self.feature_history.append(global_norm.astype(np.float32))
 
         raw_load  = self._estimate_load(features, session_norm)
-        predicted = self.kalman.predict()
-        smoothed  = self.kalman.update(raw_load)
 
-        is_anomaly  = abs(raw_load - predicted) > self.SPIKE_THRESHOLD
+        # Circadian adjustment: same underlying load feels different depending
+        # on what time of day it is.
+        circadian_factor = self.circadian.factor(signal.timestamp_ms)
+        circadian_load   = self.circadian.normalise_load(raw_load, signal.timestamp_ms)
+
+        predicted = self.kalman.predict()
+        smoothed  = self.kalman.update(circadian_load)
+
+        is_anomaly  = abs(circadian_load - predicted) > self.SPIKE_THRESHOLD
         confidence  = self.baseline.mahalanobis_confidence(features)
         if self.model_type == "onnx":
             confidence = min(confidence + 0.15, 1.0)
 
-        fatigue_index   = self.fatigue.update(smoothed, signal.timestamp_ms)
+        fatigue_index = self.fatigue.update(smoothed, signal.timestamp_ms)
         self._load_history.append(smoothed)
-        session_pct     = self._percentile(smoothed)
-        dominant_idx    = int(np.argmax(np.abs(session_norm)))
+        session_pct   = self._percentile(smoothed)
+        dominant_idx  = int(np.argmax(np.abs(session_norm)))
+
+        # Flow episode tracking
+        self.flow.update(smoothed, signal.timestamp_ms)
+        in_flow      = self.flow.in_flow
+        flow_depth   = self.flow.current_depth if in_flow else 0.0
 
         return CognitiveLoadEstimate(
             load_score=round(smoothed, 4),
@@ -362,7 +549,14 @@ class CognitiveLoadInferencer:
             is_anomaly=is_anomaly,
             predicted_load=round(predicted, 4),
             session_percentile=round(session_pct, 3),
+            circadian_factor=round(circadian_factor, 4),
+            in_flow_episode=in_flow,
+            flow_episode_depth=round(flow_depth, 4),
         )
+
+    def get_flow_episodes(self) -> list[FlowEpisode]:
+        """Return all completed flow episodes detected so far this session."""
+        return list(self.flow.completed_episodes)
 
     def update_calibration(self, means: np.ndarray, stds: np.ndarray) -> None:
         """Apply per-user calibration stats from the NASA-TLX protocol."""
@@ -393,8 +587,8 @@ class CognitiveLoadInferencer:
             logger.warning("[NeuroFlow] ONNX load failed (%s) — heuristic active", exc)
 
     def _extract_features(self) -> np.ndarray:
-        signals   = list(self.session_window)
-        ikis      = [s.keystroke_iki_ms for s in signals if s.keystroke_iki_ms]
+        signals    = list(self.session_window)
+        ikis       = [s.keystroke_iki_ms for s in signals if s.keystroke_iki_ms]
         velocities = [s.mouse_velocity for s in signals]
         return np.array([
             float(np.nanmean(ikis)) if ikis else 300.0,

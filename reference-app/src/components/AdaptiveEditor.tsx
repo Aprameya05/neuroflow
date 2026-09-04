@@ -1,14 +1,34 @@
 /**
  * AdaptiveEditor -- core adaptive CodeMirror editor component.
  * Grounded in cognitive load theory (Sweller 1988, Paas & van Merrienboer 1994, Lavie 2005).
+ *
+ * New in v2.1
+ * -----------
+ * Adaptive syntax highlighting  — in reduced/minimal states, token colour palette
+ *   is pruned to only the semantically critical colours (keywords + strings).
+ *   Operators, punctuation, and type annotations fade to near-foreground to
+ *   reduce visual density without making code unreadable.
+ *
+ * Progressive comment auto-fold — under high load (reduced/minimal), block
+ *   comments that are > 3 lines are automatically folded to one-liners. The
+ *   user can expand them; folding is re-applied only on state transitions.
+ *
+ * Contextual tooltip verbosity  — inline hover tips become shorter as load
+ *   rises: full documentation in rich/normal, a single-sentence summary in
+ *   reduced, hidden entirely in minimal. Implemented via data attributes
+ *   on the editor wrapper and companion CSS.
  */
 import CodeMirror from "@uiw/react-codemirror";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { autocompletion } from "@codemirror/autocomplete";
-import { EditorView } from "@codemirror/view";
-import { useState } from "react";
+import { EditorView, Decoration, ViewPlugin, WidgetType } from "@codemirror/view";
+import { syntaxHighlighting, HighlightStyle } from "@codemirror/language";
+import { tags } from "@lezer/highlight";
+import { StateField, StateEffect } from "@codemirror/state";
+import { foldAll, unfoldAll } from "@codemirror/language";
+import { useState, useEffect, useRef, useMemo } from "react";
 import type { UIState } from "../hooks/useNeuroFlow";
 import { getLoadColor, getLoadColorRgba } from "../utils/theme";
 
@@ -526,6 +546,76 @@ export const NEUROFLOW_CONFIG = {
 `,
 };
 
+// ── Adaptive syntax highlighting ────────────────────────────────────────────
+//
+// Full colour palette in rich/normal; pruned to semantically critical tokens
+// in reduced; near-monochrome in minimal to eliminate visual noise.
+
+const HIGHLIGHT_FULL = HighlightStyle.define([
+  { tag: tags.keyword,            color: "#c678dd", fontWeight: "bold" },
+  { tag: tags.string,             color: "#98c379" },
+  { tag: tags.comment,            color: "#5c6370", fontStyle: "italic" },
+  { tag: tags.number,             color: "#d19a66" },
+  { tag: tags.operator,           color: "#56b6c2" },
+  { tag: tags.punctuation,        color: "#abb2bf" },
+  { tag: tags.typeName,           color: "#e5c07b" },
+  { tag: tags.variableName,       color: "#e06c75" },
+  { tag: tags.function(tags.variableName), color: "#61afef" },
+  { tag: tags.definition(tags.variableName), color: "#e06c75" },
+  { tag: tags.self,               color: "#e06c75" },
+  { tag: tags.bool,               color: "#d19a66" },
+  { tag: tags.null,               color: "#d19a66" },
+  { tag: tags.regexp,             color: "#56b6c2" },
+  { tag: tags.escape,             color: "#56b6c2" },
+  { tag: tags.meta,               color: "#c678dd" },
+]);
+
+// Reduced: only keywords and strings in colour; everything else near-foreground
+const HIGHLIGHT_REDUCED = HighlightStyle.define([
+  { tag: tags.keyword,            color: "#c678dd", fontWeight: "bold" },
+  { tag: tags.string,             color: "#98c379" },
+  { tag: tags.comment,            color: "#3e4451", fontStyle: "italic" },
+  { tag: tags.number,             color: "#9da5b4" },
+  { tag: tags.operator,           color: "#9da5b4" },
+  { tag: tags.punctuation,        color: "#7a8194" },
+  { tag: tags.typeName,           color: "#9da5b4" },
+  { tag: tags.variableName,       color: "#abb2bf" },
+  { tag: tags.function(tags.variableName), color: "#9da5b4" },
+  { tag: tags.definition(tags.variableName), color: "#abb2bf" },
+  { tag: tags.self,               color: "#9da5b4" },
+  { tag: tags.bool,               color: "#9da5b4" },
+  { tag: tags.null,               color: "#9da5b4" },
+]);
+
+// Minimal: essentially monochrome — keywords barely accented, nothing else
+const HIGHLIGHT_MINIMAL = HighlightStyle.define([
+  { tag: tags.keyword,            color: "#9d7fcf", fontWeight: "bold" },
+  { tag: tags.string,             color: "#7aaa6a" },
+  { tag: tags.comment,            color: "#2e3340", fontStyle: "italic" },
+  { tag: tags.number,             color: "#8b919d" },
+  { tag: tags.operator,           color: "#6e7585" },
+  { tag: tags.punctuation,        color: "#6e7585" },
+  { tag: tags.typeName,           color: "#8b919d" },
+  { tag: tags.variableName,       color: "#8b919d" },
+  { tag: tags.function(tags.variableName), color: "#8b919d" },
+]);
+
+function getHighlightStyle(uiState: UIState) {
+  if (uiState === "reduced") return syntaxHighlighting(HIGHLIGHT_REDUCED);
+  if (uiState === "minimal") return syntaxHighlighting(HIGHLIGHT_MINIMAL);
+  return syntaxHighlighting(HIGHLIGHT_FULL);
+}
+
+// ── Tooltip verbosity attribute ─────────────────────────────────────────────
+// We set data-nf-tooltip-verbosity on the editor wrapper and use CSS to control
+// what level of hover documentation is displayed.
+// rich/normal → "full"  |  reduced → "brief"  |  minimal → "none"
+function getTooltipVerbosity(uiState: UIState): string {
+  if (uiState === "minimal") return "none";
+  if (uiState === "reduced") return "brief";
+  return "full";
+}
+
 // Adaptation values derived from cognitive load score -- UNCHANGED logic & thresholds
 function getAdaptations(uiState: UIState) {
   const adaptations = {
@@ -603,25 +693,52 @@ const FILES = [
 export function AdaptiveEditor({ uiState, score, onCodeChange, readOnly = false }: AdaptiveEditorProps) {
   const [activeFile, setActiveFile] = useState("main.py");
   const [fileContents, setFileContents] = useState<Record<string, string>>(FILE_CONTENTS);
+  const editorViewRef = useRef<EditorView | null>(null);
+  const prevStateRef  = useRef<UIState>(uiState);
 
   const adapt = getAdaptations(uiState);
-  const code = fileContents[activeFile] ?? "";
+  const code  = fileContents[activeFile] ?? "";
 
-  const pct = Math.round(score * 100);
-  const loadColor = getLoadColor(score);
+  const pct         = Math.round(score * 100);
+  const loadColor   = getLoadColor(score);
   const loadGlowLow = getLoadColorRgba(score, 0.12);
   const loadGlowHigh = getLoadColorRgba(score, 0.35);
+
+  // Progressive comment folding: fold comments when entering high-load states,
+  // unfold when recovering to rich/normal. Only fires on state transitions.
+  useEffect(() => {
+    const prev = prevStateRef.current;
+    prevStateRef.current = uiState;
+    const view = editorViewRef.current;
+    if (!view) return;
+
+    const wasLowLoad  = prev === "rich" || prev === "normal";
+    const isHighLoad  = uiState === "reduced" || uiState === "minimal";
+    const wasHighLoad = prev === "reduced" || prev === "minimal";
+    const isLowLoad   = uiState === "rich" || uiState === "normal";
+
+    if (wasLowLoad && isHighLoad) {
+      // Entering high-load — fold all foldable ranges (block comments, docstrings)
+      foldAll(view);
+    } else if (wasHighLoad && isLowLoad) {
+      // Recovering — restore full code view
+      unfoldAll(view);
+    }
+  }, [uiState]);
 
   const handleChange = (val: string) => {
     setFileContents(prev => ({ ...prev, [activeFile]: val }));
     onCodeChange?.(val);
   };
 
-  const extensions = [
+  // Memoise extensions so CodeMirror doesn't rebuild the view on every render.
+  // The highlight style is swapped per uiState — this is the main thing that changes.
+  const extensions = useMemo(() => [
     activeFile.endsWith(".py") ? python() : javascript(),
     autocompletion({ activateOnTyping: true }),
+    getHighlightStyle(uiState),
     ...(readOnly ? [EditorView.editable.of(false)] : []),
-  ];
+  ], [activeFile, uiState, readOnly]);
 
   return (
     <div style={{
@@ -841,16 +958,19 @@ export function AdaptiveEditor({ uiState, score, onCodeChange, readOnly = false 
         </div>
 
         {/* CodeMirror editor canvas */}
-        <div style={{
-          flex: 1,
-          overflow: "hidden",
-          display: "flex",
-          flexDirection: "column",
-          padding: adapt.padding,
-          opacity: adapt.opacity,
-          transition: `all ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
-          background: "#0a0d14",
-        }}>
+        <div
+          data-nf-tooltip-verbosity={getTooltipVerbosity(uiState)}
+          style={{
+            flex: 1,
+            overflow: "hidden",
+            display: "flex",
+            flexDirection: "column",
+            padding: adapt.padding,
+            opacity: adapt.opacity,
+            transition: `all ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
+            background: "#0a0d14",
+          }}
+        >
           <CodeMirror
             value={code}
             height="100%"
@@ -858,9 +978,10 @@ export function AdaptiveEditor({ uiState, score, onCodeChange, readOnly = false 
             extensions={extensions}
             onChange={handleChange}
             readOnly={readOnly}
+            onCreateEditor={(view) => { editorViewRef.current = view; }}
             basicSetup={{
               lineNumbers: adapt.showLineNumbers,
-              foldGutter: adapt.showSidebar,
+              foldGutter: true,   // always keep foldGutter available for progressive folding
               highlightActiveLine: !readOnly,
               highlightSelectionMatches: true,
               autocompletion: !readOnly,

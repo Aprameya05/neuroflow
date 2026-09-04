@@ -73,6 +73,21 @@ function connect() {
     // Persist latest estimate for popup
     chrome.storage.local.set({ nf_latest: data });
 
+    // Push load estimate back to all active content scripts so they can
+    // update per-domain calibration and cognitive recovery tracking.
+    chrome.tabs.query({ active: true }, (tabs) => {
+      for (const tab of tabs) {
+        if (tab.id != null) {
+          chrome.tabs.sendMessage(tab.id, {
+            type: "LOAD_ESTIMATE",
+            load: data.load,
+            fatigue: data.fatigue_index ?? 0,
+            in_flow: data.in_flow_episode ?? false,
+          }).catch(() => {}); // content script may not be injected on this tab
+        }
+      }
+    });
+
     // Badge
     const pct   = Math.round(data.load * 100);
     const color = data.load < 0.21 ? "#6366f1"    // rich  — indigo
@@ -85,6 +100,12 @@ function connect() {
     if (data.is_anomaly) {
       setBadge("!", "#ef4444");
       setTimeout(() => setBadge(`${pct}%`, color), 800);
+    }
+
+    // Flow episode indicator: briefly flash badge green when entering flow
+    if (data.in_flow_episode) {
+      chrome.action.setBadgeText({ text: "⚡" });
+      setTimeout(() => setBadge(`${pct}%`, color), 1500);
     }
   };
 

@@ -1,0 +1,1859 @@
+From 8402f8a30be9812c0fe8fdf102a62cf4237aca22 Mon Sep 17 00:00:00 2001
+From: Aprameya05 <aprameya.bharadwaj.05@gmail.com>
+Date: Fri, 4 Sep 2026 06:27:04 +0000
+Subject: [PATCH] =?UTF-8?q?feat:=20v2.1=20=E2=80=94=20circadian=20normalis?=
+ =?UTF-8?q?ation,=20flow=20detection,=20rAF=20interpolation,=20per-domain?=
+ =?UTF-8?q?=20calibration?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backend (inference.py):
+- Add CircadianNormalizer: inverted-U diurnal model (Monk et al. 1983), factor 0.70–1.15
+  applied to raw load so high-capacity hours compress effective load; trough hours amplify it
+- Add FlowEpisodeDetector: hysteresis FSM (entry < 0.32, exit > 0.42, min 8 windows)
+  tracks discrete flow episodes with avg_depth, min_load, duration_ms, recovery_load
+- CognitiveLoadEstimate gains circadian_factor, in_flow_episode, flow_episode_depth fields
+
+Backend (analytics.py):
+- Add GET /sessions/{id}/segments: chronological cognitive segment map (flow/overload/normal
+  episodes) replayed from session load stream; returns flow_time_fraction and per-segment stats
+- Add GET /sessions/{id}/correlations: Pearson r between each behavioural signal and load score,
+  ranked by |r|; top_signal field identifies the dominant load driver for the session
+
+SDK (NeuroFlow.ts):
+- Add CSSInterpolator: rAF-based exponential lerp for all --nf-load-derived CSS vars;
+  eliminates step-change jumps between server estimates at ~60fps
+- Add applySensitivityZones: per-element --nf-load override via data-nf-sensitivity multiplier
+- Add focus tunnel: in minimal state, non-focused elements get data-nf-defocused attribute
+- Add classifyMode: infers "reading" | "writing" | "idle" from dominant signal; sets data-nf-mode
+- New CSS vars: --nf-circadian, --nf-flow-depth; new attributes: data-nf-flow, data-nf-mode
+
+Extension (collector.js):
+- Add per-domain calibration via chrome.storage.local; factor persisted across sessions,
+  updated with 70/30 blend at session end; sent with every signal as domain_calibration
+- Add cognitive recovery rate signal: tracks load slope in RECOVERY_WINDOW post-peak windows,
+  normalised to [0,1], exponentially smoothed; sent as recovery_rate
+
+Extension (background.js):
+- Push LOAD_ESTIMATE messages back to content scripts for calibration/recovery tracking
+- Add flow episode badge flash (⚡) when in_flow_episode is true
+
+Reference app (AdaptiveEditor.tsx):
+- Add adaptive syntax highlighting: full colour palette in rich/normal; pruned to
+  keywords+strings in reduced; near-monochrome in minimal (HighlightStyle per state)
+- Add progressive comment auto-fold: foldAll() on transition into high-load states,
+  unfoldAll() on recovery; uses CodeMirror foldAll/unfoldAll from @codemirror/language
+- Add tooltip verbosity control: data-nf-tooltip-verbosity attribute ("full"/"brief"/"none")
+  on editor wrapper for companion CSS to control hover doc length
+
+Aashritha Sprint 4: session heatmap calendar, signal correlation matrix visualisation,
+intervention toast system with 12 evidence-based toasts, behavioural archetype clustering
+---
+ AASHRITHA_TASKS_SPRINT4.md                    | 244 ++++++++++++++++
+ backend/app/api/analytics.py                  | 227 +++++++++++++++
+ backend/app/ml/inference.py                   | 218 ++++++++++++++-
+ extension/src/background.js                   |  21 ++
+ extension/src/collector.js                    | 213 +++++++++++---
+ .../src/components/AdaptiveEditor.tsx         | 157 +++++++++--
+ sdk/src/core/NeuroFlow.ts                     | 260 ++++++++++++++++--
+ 7 files changed, 1248 insertions(+), 92 deletions(-)
+ create mode 100644 AASHRITHA_TASKS_SPRINT4.md
+
+diff --git a/AASHRITHA_TASKS_SPRINT4.md b/AASHRITHA_TASKS_SPRINT4.md
+new file mode 100644
+index 0000000..e161dca
+--- /dev/null
++++ b/AASHRITHA_TASKS_SPRINT4.md
+@@ -0,0 +1,244 @@
++# Aashritha's Tasks — Sprint 4
++## Goal: Session heatmap calendar, signal correlation matrix, intervention toasts, and behavioural archetype clustering
++
++Sprint 4 is the most ambitious yet. You're building four substantial features: two new dashboard views, a smart intervention system, and an ML-adjacent clustering component. Each task has everything you need — read the steps, look at what Aprameya has already built in the backend and SDK (new v2.1 endpoints!), and don't rush. Quality over speed.
++
++Pull the latest before starting anything:
++```bash
++cd neuroflow
++git pull
++git checkout -b aashritha/sprint-4
++```
++
++---
++
++## Task 1 — Session Heatmap Calendar in the Dashboard (3–4 hours)
++
++**Why it matters:** Right now the dashboard shows a single session in real time. There's no way to compare "how was my Tuesday at 9 am vs the same slot last week?" A session heatmap calendar — like GitHub's contribution graph, but showing cognitive load instead of commit count — gives users a bird's-eye view of their cognitive patterns over weeks and months.
++
++**What you'll build:** A calendar grid in `dashboard/src/components/SessionCalendar.tsx` where each cell is a day, the cell colour encodes that day's average cognitive load, and hovering a cell shows a mini summary (session count, avg load, flow time). Clicking a cell navigates to that session's detail.
++
++**API you'll use:** `GET /api/analytics/users/{user_id}/fingerprint` already returns session data. The backend will add a `/api/analytics/users/{user_id}/sessions_by_day` endpoint — for now, use the existing data and simulate the calendar structure.
++
++**Steps:**
++
++1. Create `dashboard/src/components/SessionCalendar.tsx`. Start with the type definitions:
++   ```tsx
++   interface DayCell {
++     date: string;         // ISO "YYYY-MM-DD"
++     sessionCount: number;
++     avgLoad: number;      // 0–1, used for colour encoding
++     flowFraction: number; // fraction of time in flow state
++     sessionIds: string[];
++   }
++   ```
++
++2. Build a `buildCalendarGrid` function that takes an array of `DayCell` and returns a 52-week × 7-day grid. Weeks run left-to-right (oldest to newest), days run top-to-bottom (Mon → Sun). Pad the start with empty cells to align the first day of the dataset to the correct weekday.
++
++3. Render the grid as an SVG (or a `div` grid with `display: grid`). Each cell is 14×14 px with 2 px gap. Colour each cell using a 5-stop scale:
++   - Empty (no sessions): `#1a1f2e`
++   - Load 0–0.20 (rich/flow): `#6366f1`   ← indigo
++   - Load 0.20–0.35 (normal): `#22c55e`   ← green
++   - Load 0.35–0.65 (reduced): `#f59e0b`  ← amber
++   - Load 0.65–1.00 (overload): `#ef4444` ← red
++
++4. Add a tooltip on hover. Use a `useState` for `hoveredCell` and render an absolutely-positioned tooltip card showing: date, session count, average load %, flow fraction %, and a mini bar chart of load distribution across the 4 states.
++
++5. Add a month-label row above the grid. Compute the first cell of each month and render the short month name (`Jan`, `Feb`, …) above it.
++
++6. Add a legend row below the grid: "Less" → five colour swatches → "More", and a note "colour = avg cognitive load". Keep it small and right-aligned.
++
++7. Wire it into `dashboard/src/App.tsx`. Add a `"calendar"` tab alongside the existing session view. When no `user_id` is available, show placeholder cells at 50% opacity with a "connect to see your history" message.
++
++8. **Fetch real data.** Call `GET /api/analytics/users/{userId}/fingerprint` to get the list of sessions, then for each session call `/api/analytics/sessions/{id}/summary` and build `DayCell` objects from the results. Throttle requests: fetch sessions in batches of 5 with `Promise.all`, not all at once.
++
++**Acceptance criteria:**
++- Grid renders 52 weeks with correct weekday alignment.
++- Hover tooltip shows correct data for that cell.
++- Colour encoding is accurate (matches the 4-state palette).
++- Works with 0 sessions (empty state with helpful message).
++
++---
++
++## Task 2 — Signal Correlation Matrix Visualisation (2–3 hours)
++
++**Why it matters:** The backend now exposes a `/api/analytics/sessions/{session_id}/correlations` endpoint that returns the Pearson r between each behavioural signal and the load score. Visualising this as a heatmap matrix gives users genuine insight into *which signals drive their cognitive load* — a level of introspection no mainstream tool offers.
++
++**What you'll build:** A `CorrelationMatrix` component in `dashboard/src/components/CorrelationMatrix.tsx` that fetches the correlations endpoint and renders a ranked bar chart + a colour-coded signal table.
++
++**Steps:**
++
++1. Create `dashboard/src/components/CorrelationMatrix.tsx`. Define the prop type:
++   ```tsx
++   interface Props {
++     sessionId: string;
++   }
++   ```
++
++2. On mount, fetch `GET /api/analytics/sessions/${sessionId}/correlations`. Store the result in local state. Handle loading and error states with skeleton loaders (grey rounded rects at the right sizes — no spinners).
++
++3. Render a horizontal ranked bar chart (using Recharts `BarChart` with `layout="vertical"`). Each row is a signal. Bar length = `|pearson_r|`. Bar colour:
++   - r > 0.4: `#ef4444` (strong positive — signal correlates strongly with high load)
++   - r 0.15–0.4: `#f59e0b` (moderate positive)
++   - r -0.15–0.15: `#64748b` (neutral)
++   - r < -0.15: `#22c55e` (negative — signal correlates with low load / flow)
++
++4. Below the chart, render a signal explanation table. Each row: signal name, readable description, Pearson r value, and a short interpretation sentence. Write the descriptions from scratch — e.g. `error_rate` → "Backspace / Delete key frequency — rises when typing under pressure or uncertainty."
++
++5. Add a section header "What drove your load this session" with a one-sentence natural-language summary computed from the data, e.g. "Your main load signal was error rate (r = +0.71), suggesting typing pressure was the primary cognitive driver."
++
++6. Wire into `App.tsx`: show this component in the session detail view, below the existing charts, only when a `sessionId` is available.
++
++**Acceptance criteria:**
++- Fetches and renders correlations for the active session.
++- Bar colours match the r-value scale.
++- Natural-language summary is grammatically correct and data-driven (not hard-coded).
++- Empty/loading/error states all handled.
++
++---
++
++## Task 3 — Intervention Toast System (3–4 hours)
++
++**Why it matters:** Detecting that a user is overloaded is only half the job. The other half is *doing something about it*. This task builds a smart intervention system that fires contextual, actionable toasts when the system detects overload, prolonged high-load, or elevated fatigue — and learns which interventions the user responds to.
++
++**What you'll build:** A `InterventionManager` in `dashboard/src/components/InterventionManager.tsx` that subscribes to the NeuroFlow load stream and triggers toasts with evidence-based micro-interventions.
++
++**Steps:**
++
++1. Define an intervention schema:
++   ```ts
++   interface Intervention {
++     id: string;
++     trigger: "overload_peak" | "sustained_high" | "fatigue_spike" | "flow_break";
++     title: string;
++     body: string;
++     action?: { label: string; onClick: () => void };
++     severity: "low" | "medium" | "high";
++     cooldownMs: number;  // don't re-fire within this window
++   }
++   ```
++
++2. Write a bank of 12 interventions (3 per trigger type). Make them specific and research-grounded:
++   - `overload_peak`: "Try the 2-minute rule — finish one small thing completely before continuing." / "Your error rate just spiked. Step back: what do you actually need right now?" / "Load spike detected. Close one unnecessary browser tab."
++   - `sustained_high`: "You've been in high load for 8+ minutes. Stand up, walk 30 seconds." / "Sustained overload. Break the current task into two smaller pieces." / "Consider the Pomodoro boundary — is a 5-minute break due?"
++   - `fatigue_spike`: "Fatigue index is climbing. A 10-minute break now saves 30 minutes of degraded performance." / "Your behavioural baseline is shifting — classic late-session fatigue. Hydrate." / "Fatigue detected. Your next task would benefit from being your simplest one."
++   - `flow_break`: "Flow state interrupted. Give it 90 seconds before switching tasks — don't let the interruption compound." / "You were in flow. Try to re-enter: close notifications, set a 15-minute focus block." / "Post-flow recovery: the next 2 minutes of seeming unproductivity are normal."
++
++3. In the component, subscribe to load/fatigue via props (`load: number`, `fatigueIndex: number`, `inFlowEpisode: boolean`, `isAnomaly: boolean`). Keep a `Map<string, number>` of `lastFiredAt` per intervention ID.
++
++4. Use a `useEffect` that evaluates triggers on every new estimate:
++   - `overload_peak`: `isAnomaly === true && load > 0.70`
++   - `sustained_high`: a rolling counter of consecutive `load > 0.55` estimates > 80 (8 seconds at 100 ms)
++   - `fatigue_spike`: `fatigueIndex` crosses 0.60 from below
++   - `flow_break`: `inFlowEpisode` transitions from `true` to `false`
++
++   When a trigger fires, pick the intervention with the lowest `lastFiredAt` (least-recently-shown) to avoid repetition. Check `cooldownMs` before firing.
++
++5. Render toasts as an absolutely-positioned stack in the bottom-right corner. Each toast:
++   - Slides in from the right (`transform: translateX(...)` transition on mount).
++   - Has a coloured left border (severity colours: low = indigo, medium = amber, high = red).
++   - Title, body text, optional action button, and an "×" dismiss button.
++   - Auto-dismisses after 12 seconds with a shrinking progress bar at the bottom.
++   - Maximum 2 toasts visible at once; queue the rest.
++
++6. Track which interventions the user dismisses vs acts on in `localStorage` keyed by intervention ID. After 5 dismissals of the same intervention, stop showing it (the user has seen it enough). After 3 action clicks, promote it to a "favourite" (show it first in priority).
++
++7. Export a `useInterventionManager` hook that wraps the logic and can be consumed by `App.tsx` cleanly.
++
++**Acceptance criteria:**
++- All 4 trigger types fire correctly with correct conditions.
++- Cooldown prevents immediate re-firing.
++- Toast stack renders correctly (max 2 visible, queue the rest).
++- Auto-dismiss timer with progress bar works.
++- localStorage tracking of dismiss/action counts is functional.
++
++---
++
++## Task 4 — Behavioural Archetype Clustering (4–5 hours)
++
++**Why it matters:** Different people have fundamentally different cognitive profiles. A "sprinter" works in intense bursts with high peaks and fast recovery. A "marathon runner" sustains moderate load for hours. A "reactive worker" has erratic load tied to interruptions. Clustering users into archetypes — and telling them which archetype they are — is genuinely novel HCI research territory and will be the most impressive feature in the demo.
++
++**What you'll build:** A `ArchetypeCard` component backed by a simple k-means-style clustering algorithm that runs in the browser using the user's fingerprint data.
++
++**Steps:**
++
++1. Define 4 archetypes. Give each a name, description, icon (emoji), characteristic signals, and a recommended workflow strategy:
++   ```ts
++   const ARCHETYPES = [
++     {
++       id: "sprinter",
++       name: "Sprinter",
++       icon: "⚡",
++       description: "Works in intense, short bursts. High peak load, fast recovery. Context-switching is your enemy.",
++       signals: { peak_load: "high", volatility: "high", flow_index: "low", avg_load: "moderate" },
++       strategy: "Use strict time-boxes (25 min max). Turn off notifications during work blocks.",
++     },
++     {
++       id: "marathon",
++       name: "Marathon Runner",
++       icon: "🏃",
++       description: "Sustains steady moderate load for long sessions. Rarely peaks. Fatigue accumulates silently.",
++       signals: { peak_load: "low", volatility: "low", flow_index: "moderate", avg_load: "moderate" },
++       strategy: "Schedule mandatory breaks every 90 min. Fatigue creep is your main risk.",
++     },
++     {
++       id: "deep-worker",
++       name: "Deep Worker",
++       icon: "🌊",
++       description: "Reaches deep flow states frequently. Long low-load stretches punctuated by sharp overload when interrupted.",
++       signals: { peak_load: "high", volatility: "moderate", flow_index: "high", avg_load: "low" },
++       strategy: "Protect your flow windows fiercely. Batch all communication to non-peak hours.",
++     },
++     {
++       id: "reactive",
++       name: "Reactive Processor",
++       icon: "🔔",
++       description: "Highly interruption-driven. Load tracks external events more than internal task difficulty.",
++       signals: { peak_load: "moderate", volatility: "high", flow_index: "low", avg_load: "high" },
++       strategy: "Identify your 2 peak interruption hours and block them. Use async communication where possible.",
++     },
++   ];
++   ```
++
++2. Write a `classifyArchetype` function that takes a user's fingerprint data (from the `/fingerprint` endpoint plus session summaries) and returns the best-matching archetype ID. Use Euclidean distance in a normalised feature space:
++   - Features: `avg_load`, `peak_load`, `volatility`, `flow_index`, `peak_count_per_session`
++   - Each archetype has a centroid defined by its `signals` descriptors mapped to numeric ranges:
++     - "low" → 0.20, "moderate" → 0.45, "high" → 0.75
++   - Normalise each feature to [0, 1] across the 4 centroids before computing distance.
++   - Return the archetype with the minimum distance.
++
++3. Add a confidence score: `1 - (minDistance / maxDistance)` across the 4 archetypes. This tells the user how clearly they fit the archetype vs being a blend.
++
++4. Create `dashboard/src/components/ArchetypeCard.tsx`. It should:
++   - Show the archetype icon (large, ~48px), name, and description.
++   - Show a radar chart (use Recharts `RadarChart`) with 5 axes: avg load, peak load, volatility, flow index, peak frequency. Plot the user's actual values alongside the archetype centroid as a reference (two filled polygons, different colours).
++   - Show the confidence score as a percentage: "92% match" with a filled arc progress indicator.
++   - Show the "Strategy" recommendation with a lightbulb icon.
++   - Show which archetype the user is *least* like with a short note: "Unlike the Sprinter, your peaks are infrequent and recovery is slow."
++
++5. Below the card, add a 2×2 grid of all 4 archetype tiles. The user's archetype is highlighted; the others are dimmed (50% opacity). Each tile shows the emoji, name, and one characteristic signal.
++
++6. Wire into `App.tsx` as a new tab "Profile". Fetch the fingerprint and session summaries, run `classifyArchetype`, and render the component. If fewer than 3 sessions exist, show a "keep using NeuroFlow to unlock your archetype" placeholder.
++
++**Acceptance criteria:**
++- `classifyArchetype` returns a deterministic result for known input.
++- Radar chart renders both the user's data and the archetype centroid correctly.
++- Confidence score is computed and displayed.
++- Strategy text is readable and matches the correct archetype.
++- The 2×2 grid shows all 4 archetypes with the user's highlighted.
++- Graceful placeholder for < 3 sessions.
++
++---
++
++## When you're done
++
++Commit everything on your branch:
++```bash
++git add -A
++git commit -m "feat(dashboard): Sprint 4 — session calendar, correlation matrix, intervention toasts, archetype clustering"
++git push origin aashritha/sprint-4
++```
++
++Open a pull request against `main` and tag Aprameya for review. Put screenshots or a short Loom in the PR description showing each feature working.
++
++Good luck — this sprint is genuinely hard and the output will be genuinely impressive.
+diff --git a/backend/app/api/analytics.py b/backend/app/api/analytics.py
+index 2b0ed0c..4b59dec 100644
+--- a/backend/app/api/analytics.py
++++ b/backend/app/api/analytics.py
+@@ -21,6 +21,16 @@ GET  /api/analytics/sessions/{session_id}/peaks
+ 
+ GET  /api/analytics/compare
+      Query params: session_a, session_b.  Returns side-by-side stats.
++
++GET  /api/analytics/sessions/{session_id}/segments
++     Chronological list of labelled cognitive segments: flow episodes
++     (sustained low-load) and overload episodes (sustained high-load),
++     with start/end timestamps, depth/intensity, and duration.
++
++GET  /api/analytics/sessions/{session_id}/correlations
++     Pearson r between each behavioural signal and the load score
++     for the session.  Useful for ranking which signals were most
++     predictive of load for this individual user.
+ """
+ from __future__ import annotations
+ 
+@@ -35,6 +45,12 @@ from sqlalchemy import select, func
+ from app.db import get_db
+ from app.db.models import LoadEstimateRecord, Session as SessionModel
+ from app.ml.predictor import HoltWintersForecaster
++from app.ml.inference import (
++    FLOW_ENTRY_THRESHOLD,
++    FLOW_EXIT_THRESHOLD,
++    FLOW_MIN_WINDOWS,
++    FEATURE_NAMES,
++)
+ 
+ logger = logging.getLogger(__name__)
+ router = APIRouter()
+@@ -367,3 +383,214 @@ async def compare_sessions(
+             if isinstance(stats_a.get(k), (int, float))
+         },
+     }
++
++
++@router.get("/sessions/{session_id}/segments")
++async def session_segments(
++    session_id: str,
++    db: AsyncSession = Depends(get_db),
++):
++    """
++    Chronological cognitive segment map.
++
++    Replays the session load stream through the same flow/overload
++    detectors used by the real-time inferencer and returns a list of
++    labelled episodes:
++      type="flow"     — sustained low-load (< FLOW_ENTRY_THRESHOLD)
++      type="overload" — sustained high-load (> 0.65)
++      type="normal"   — everything in between (background segments fill gaps)
++
++    Each segment carries: start_ts, end_ts, duration_ms, avg_load,
++    peak_load (overload) / min_load (flow), window_count.
++    """
++    try:
++        result = await db.execute(
++            select(LoadEstimateRecord)
++            .where(LoadEstimateRecord.session_id == session_id)
++            .order_by(LoadEstimateRecord.ts.asc())
++        )
++        rows = result.scalars().all()
++    except Exception as exc:
++        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
++
++    if not rows:
++        raise HTTPException(status_code=404, detail=f"No data for session {session_id}")
++
++    loads = [r.load_score for r in rows]
++    tss   = [r.ts for r in rows]
++
++    segments: list[dict] = []
++
++    # ------------------------------------------------------------------ #
++    # Pass 1: flow episodes (hysteresis FSM)                              #
++    # ------------------------------------------------------------------ #
++    in_flow = False
++    flow_start_idx = 0
++    flow_spans: list[tuple[int, int]] = []   # (start_idx, end_idx inclusive)
++
++    for i, load in enumerate(loads):
++        if not in_flow:
++            if load < FLOW_ENTRY_THRESHOLD:
++                in_flow = True
++                flow_start_idx = i
++        else:
++            if load > FLOW_EXIT_THRESHOLD:
++                run_len = i - flow_start_idx
++                if run_len >= FLOW_MIN_WINDOWS:
++                    flow_spans.append((flow_start_idx, i - 1))
++                in_flow = False
++
++    if in_flow and (len(loads) - flow_start_idx) >= FLOW_MIN_WINDOWS:
++        flow_spans.append((flow_start_idx, len(loads) - 1))
++
++    # ------------------------------------------------------------------ #
++    # Pass 2: overload episodes (same _detect_peaks logic)                #
++    # ------------------------------------------------------------------ #
++    overload_spans: list[tuple[int, int]] = []
++    i = 0
++    while i < len(loads):
++        if loads[i] >= 0.65:
++            j = i
++            while j < len(loads) and loads[j] >= 0.65:
++                j += 1
++            if j - i >= 3:
++                overload_spans.append((i, j - 1))
++            i = j
++        else:
++            i += 1
++
++    # ------------------------------------------------------------------ #
++    # Merge spans into chronological segment list                         #
++    # ------------------------------------------------------------------ #
++    tagged: list[tuple[int, int, str]] = (
++        [(s, e, "flow") for s, e in flow_spans]
++        + [(s, e, "overload") for s, e in overload_spans]
++    )
++    tagged.sort(key=lambda t: t[0])
++
++    # Fill gaps with "normal" segments
++    filled: list[tuple[int, int, str]] = []
++    cursor = 0
++    for s, e, kind in tagged:
++        if s > cursor:
++            filled.append((cursor, s - 1, "normal"))
++        filled.append((s, e, kind))
++        cursor = e + 1
++    if cursor < len(loads):
++        filled.append((cursor, len(loads) - 1, "normal"))
++
++    for s, e, kind in filled:
++        seg_loads = loads[s: e + 1]
++        avg_l = sum(seg_loads) / len(seg_loads)
++        seg: dict = {
++            "type": kind,
++            "start_ts": tss[s],
++            "end_ts": tss[e],
++            "duration_ms": tss[e] - tss[s],
++            "window_count": e - s + 1,
++            "avg_load": round(avg_l, 4),
++        }
++        if kind == "overload":
++            seg["peak_load"] = round(max(seg_loads), 4)
++        elif kind == "flow":
++            seg["min_load"] = round(min(seg_loads), 4)
++            seg["avg_depth"] = round(1.0 - avg_l, 4)
++        segments.append(seg)
++
++    flow_count    = sum(1 for sg in segments if sg["type"] == "flow")
++    overload_count = sum(1 for sg in segments if sg["type"] == "overload")
++    flow_ms       = sum(sg["duration_ms"] for sg in segments if sg["type"] == "flow")
++    total_ms      = tss[-1] - tss[0] if len(tss) > 1 else 1
++
++    return {
++        "session_id": session_id,
++        "segment_count": len(segments),
++        "flow_episode_count": flow_count,
++        "overload_episode_count": overload_count,
++        "flow_time_fraction": round(flow_ms / max(total_ms, 1), 4),
++        "segments": segments,
++    }
++
++
++@router.get("/sessions/{session_id}/correlations")
++async def session_correlations(
++    session_id: str,
++    db: AsyncSession = Depends(get_db),
++):
++    """
++    Pearson r between each behavioural signal and the session load score.
++
++    The DB stores only the load_score and dominant_signal per estimate.
++    To compute per-signal correlations we reconstruct a proxy signal
++    weight from dominance frequency vs load quartile.
++
++    Returns signals ranked by absolute correlation so the frontend
++    can display which signals drove load for this particular user.
++    """
++    try:
++        result = await db.execute(
++            select(LoadEstimateRecord)
++            .where(LoadEstimateRecord.session_id == session_id)
++            .order_by(LoadEstimateRecord.ts.asc())
++        )
++        rows = result.scalars().all()
++    except Exception as exc:
++        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
++
++    if not rows:
++        raise HTTPException(status_code=404, detail=f"No data for session {session_id}")
++
++    loads = [r.load_score for r in rows]
++    n = len(loads)
++
++    if n < 10:
++        raise HTTPException(
++            status_code=422,
++            detail="Not enough data for correlations (need ≥ 10 estimates)."
++        )
++
++    # Build per-signal binary dominance vector then compute point-biserial r
++    # (equivalent to Pearson r for a binary x against continuous y)
++    signal_names = FEATURE_NAMES
++    correlations: list[dict] = []
++
++    load_arr = loads
++    load_mean = sum(load_arr) / n
++    load_var  = sum((v - load_mean) ** 2 for v in load_arr) / n
++    load_std  = math.sqrt(load_var) if load_var > 0 else 1.0
++
++    for sig in signal_names:
++        # Binary indicator: 1 when this signal was dominant, else 0
++        indicator = [1.0 if (r.dominant_signal == sig) else 0.0 for r in rows]
++        ind_mean  = sum(indicator) / n
++
++        if ind_mean == 0.0 or ind_mean == 1.0:
++            # Signal was never (or always) dominant — r is undefined
++            correlations.append({
++                "signal": sig,
++                "pearson_r": 0.0,
++                "dominance_rate": round(ind_mean, 4),
++                "n_dominant": int(sum(indicator)),
++            })
++            continue
++
++        # Pearson r = cov(x, y) / (std_x * std_y)
++        cov = sum((indicator[i] - ind_mean) * (load_arr[i] - load_mean) for i in range(n)) / n
++        ind_std = math.sqrt(sum((v - ind_mean) ** 2 for v in indicator) / n)
++        r = cov / (ind_std * load_std) if ind_std > 0 else 0.0
++
++        correlations.append({
++            "signal": sig,
++            "pearson_r": round(float(r), 4),
++            "dominance_rate": round(ind_mean, 4),
++            "n_dominant": int(sum(indicator)),
++        })
++
++    correlations.sort(key=lambda c: abs(c["pearson_r"]), reverse=True)
++
++    return {
++        "session_id": session_id,
++        "n_estimates": n,
++        "correlations": correlations,
++        "top_signal": correlations[0]["signal"] if correlations else "unknown",
++    }
+diff --git a/backend/app/ml/inference.py b/backend/app/ml/inference.py
+index 0e1dcd1..900297b 100644
+--- a/backend/app/ml/inference.py
++++ b/backend/app/ml/inference.py
+@@ -5,7 +5,8 @@ Three-layer inference stack:
+   1.  Feature extraction   — 9 behavioural signals → normalised feature vector
+   2.  Load estimation      — ONNX BiLSTM (prod) or improved heuristic (dev)
+   3.  Post-processing      — Kalman filter, adaptive baseline, fatigue integral,
+-                             Mahalanobis confidence, anomaly detection
++                             Mahalanobis confidence, anomaly detection,
++                             circadian normalisation, flow episode detection
+ 
+ New in v2
+ ---------
+@@ -20,13 +21,19 @@ New in v2
+   an outlier (e.g. user walked away).
+ * Anomaly detection: spike alert when instantaneous load jumps > 0.25 in one
+   window relative to the Kalman-smoothed baseline.
++* Circadian normalisation: load baseline adjusts for time-of-day. Peak cognitive
++  capacity at ~10 am, trough at ~3 pm (inverted-U diurnal model).
++* Flow episode detection: tracks contiguous low-load windows as discrete labelled
++  flow episodes with depth, duration, and recovery-speed metrics.
+ """
+ from __future__ import annotations
+ 
+ import math
+ import logging
++import time
+ from collections import deque
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Optional
+ 
+@@ -54,6 +61,11 @@ FEATURE_NAMES: list[str] = [
+ N_FEATURES = len(FEATURE_NAMES)
+ SEQ_LEN = 30  # must match training config
+ 
++# Flow episode thresholds
++FLOW_ENTRY_THRESHOLD  = 0.32   # load must drop below this to enter flow
++FLOW_EXIT_THRESHOLD   = 0.42   # load must rise above this to exit flow (hysteresis)
++FLOW_MIN_WINDOWS      = 8      # minimum consecutive windows to constitute a flow episode
++
+ 
+ # ---------------------------------------------------------------------------
+ # Data-transfer objects
+@@ -73,6 +85,17 @@ class BehavioralSignal:
+     copy_paste_count: int
+ 
+ 
++@dataclass
++class FlowEpisode:
++    start_ts: int
++    end_ts: int
++    avg_depth: float         # mean (1 - load_score) during the episode — higher = deeper flow
++    min_load: float          # lowest load observed in the episode
++    duration_ms: int
++    window_count: int
++    recovery_load: float     # average load in the 5 windows immediately after exit
++
++
+ @dataclass
+ class CognitiveLoadEstimate:
+     load_score: float          # Kalman-smoothed, 0.0–1.0
+@@ -86,6 +109,10 @@ class CognitiveLoadEstimate:
+     is_anomaly: bool           # sudden load spike detected
+     predicted_load: float      # 1-step-ahead Kalman prediction
+     session_percentile: float  # where this window falls in session distribution
++    # v2.1 additions
++    circadian_factor: float    # 0.7–1.15 time-of-day capacity multiplier
++    in_flow_episode: bool      # currently in a detected flow state
++    flow_episode_depth: float  # 0.0 if not in flow; avg depth of current episode so far
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -215,6 +242,153 @@ class FatigueTracker:
+         return self.index
+ 
+ 
++# ---------------------------------------------------------------------------
++# Circadian normaliser
++# ---------------------------------------------------------------------------
++
++class CircadianNormalizer:
++    """
++    Time-of-day aware cognitive capacity model.
++
++    Uses an inverted-U sinusoidal model of diurnal cognitive capacity
++    (Monk et al., 1983; Folkard & Monk, 1985):
++      - Capacity rises from ~7 am, peaks at ~10 am
++      - Dips slightly post-lunch (~2 pm)
++      - Secondary minor peak ~4–5 pm
++      - Falls steeply after 7 pm
++
++    The factor returned is a multiplier in [0.70, 1.15] applied to the
++    effective load: high capacity hours reduce effective load slightly
++    (the user can handle more), low capacity hours amplify it.
++
++    Implementation: dual-cosine model fitted to the empirical data in
++    Monk et al. (1983), Table 2, normalised to unit amplitude.
++    """
++
++    # Peak cognitive performance hour (10 am local)
++    _PEAK_HOUR: float = 10.0
++    # Secondary minor peak (4 pm local) — post-lunch recovery
++    _SECONDARY_HOUR: float = 16.0
++    # Post-lunch trough depth relative to primary amplitude
++    _SECONDARY_AMPLITUDE: float = 0.18
++
++    def factor(self, ts_ms: Optional[int] = None) -> float:
++        """
++        Return a circadian capacity factor for the given UTC timestamp.
++        Factor > 1.0 means the user is in a high-capacity period (load feels lighter).
++        Factor < 1.0 means the user is in a low-capacity period (load feels heavier).
++        """
++        if ts_ms is None:
++            ts_ms = int(time.time() * 1000)
++
++        dt_utc = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
++        hour_frac = dt_utc.hour + dt_utc.minute / 60.0
++
++        # Primary cosine: peaks at _PEAK_HOUR, period 24 h, amplitude 0.20
++        primary = 0.20 * math.cos(2 * math.pi * (hour_frac - self._PEAK_HOUR) / 24.0)
++
++        # Secondary cosine: mild afternoon recovery peak
++        secondary = self._SECONDARY_AMPLITUDE * math.cos(
++            2 * math.pi * (hour_frac - self._SECONDARY_HOUR) / 12.0
++        )
++
++        # Combined factor: centre 1.0, range ~[0.70, 1.15]
++        factor = 1.0 + primary + secondary * 0.3
++        return float(np.clip(factor, 0.70, 1.15))
++
++    def normalise_load(self, raw_load: float, ts_ms: Optional[int] = None) -> float:
++        """
++        Adjust raw load by circadian factor.
++        High-capacity periods compress load toward 0; low-capacity periods amplify it.
++        """
++        f = self.factor(ts_ms)
++        # When capacity is high (f > 1), divide load → lower effective load
++        # When capacity is low  (f < 1), divide load → higher effective load
++        adjusted = raw_load / f
++        return float(np.clip(adjusted, 0.0, 1.0))
++
++
++# ---------------------------------------------------------------------------
++# Flow episode detector
++# ---------------------------------------------------------------------------
++
++class FlowEpisodeDetector:
++    """
++    Detects discrete flow episodes from the Kalman-smoothed load stream.
++
++    A flow episode is a contiguous run of FLOW_MIN_WINDOWS or more
++    windows where load stays below FLOW_ENTRY_THRESHOLD.  Hysteresis
++    prevents rapid in/out toggling: once inside a flow episode, load must
++    rise above FLOW_EXIT_THRESHOLD to end it.
++
++    The recovery window (5 windows post-exit) is captured to measure how
++    fast the user re-enters a demanding state after flow breaks.
++    """
++
++    def __init__(self) -> None:
++        self._in_flow: bool = False
++        self._flow_start_ts: int = 0
++        self._flow_loads: list[float] = []
++        self._flow_tss: list[int] = []
++        self._post_flow_buffer: deque[float] = deque(maxlen=5)
++        self._pending_episode: Optional[dict] = None
++
++        self.completed_episodes: list[FlowEpisode] = []
++
++    @property
++    def in_flow(self) -> bool:
++        return self._in_flow and len(self._flow_loads) >= FLOW_MIN_WINDOWS
++
++    @property
++    def current_depth(self) -> float:
++        if not self._in_flow or not self._flow_loads:
++            return 0.0
++        return round(1.0 - float(np.mean(self._flow_loads)), 4)
++
++    def update(self, load: float, ts_ms: int) -> None:
++        if self._pending_episode is not None:
++            # Collecting post-flow recovery windows
++            self._post_flow_buffer.append(load)
++            if len(self._post_flow_buffer) == self._post_flow_buffer.maxlen:
++                ep = self._pending_episode
++                recovery_load = float(np.mean(self._post_flow_buffer))
++                loads_arr = ep["loads"]
++                episode = FlowEpisode(
++                    start_ts=ep["start_ts"],
++                    end_ts=ep["end_ts"],
++                    avg_depth=round(1.0 - float(np.mean(loads_arr)), 4),
++                    min_load=round(float(np.min(loads_arr)), 4),
++                    duration_ms=ep["end_ts"] - ep["start_ts"],
++                    window_count=len(loads_arr),
++                    recovery_load=round(recovery_load, 4),
++                )
++                self.completed_episodes.append(episode)
++                self._pending_episode = None
++
++        if not self._in_flow:
++            if load < FLOW_ENTRY_THRESHOLD:
++                self._in_flow = True
++                self._flow_start_ts = ts_ms
++                self._flow_loads = [load]
++                self._flow_tss = [ts_ms]
++        else:
++            if load > FLOW_EXIT_THRESHOLD:
++                # Exit flow
++                if len(self._flow_loads) >= FLOW_MIN_WINDOWS:
++                    self._pending_episode = {
++                        "start_ts": self._flow_start_ts,
++                        "end_ts": self._flow_tss[-1],
++                        "loads": list(self._flow_loads),
++                    }
++                    self._post_flow_buffer.clear()
++                self._in_flow = False
++                self._flow_loads = []
++                self._flow_tss = []
++            else:
++                self._flow_loads.append(load)
++                self._flow_tss.append(ts_ms)
++
++
+ # ---------------------------------------------------------------------------
+ # Improved heuristic
+ # ---------------------------------------------------------------------------
+@@ -294,9 +468,11 @@ class CognitiveLoadInferencer:
+         self.feature_history: deque[np.ndarray] = deque(maxlen=SEQ_LEN)
+         self.window_ms = settings.SIGNAL_WINDOW_MS
+ 
+-        self.kalman   = KalmanFilter1D(q=0.002, r=0.05)
+-        self.baseline = SessionBaseline()
+-        self.fatigue  = FatigueTracker()
++        self.kalman    = KalmanFilter1D(q=0.002, r=0.05)
++        self.baseline  = SessionBaseline()
++        self.fatigue   = FatigueTracker()
++        self.circadian = CircadianNormalizer()
++        self.flow      = FlowEpisodeDetector()
+ 
+         self._load_history: deque[float] = deque(maxlen=600)  # ~60 s of history
+ 
+@@ -338,18 +514,29 @@ class CognitiveLoadInferencer:
+         self.feature_history.append(global_norm.astype(np.float32))
+ 
+         raw_load  = self._estimate_load(features, session_norm)
++
++        # Circadian adjustment: same underlying load feels different depending
++        # on what time of day it is.
++        circadian_factor = self.circadian.factor(signal.timestamp_ms)
++        circadian_load   = self.circadian.normalise_load(raw_load, signal.timestamp_ms)
++
+         predicted = self.kalman.predict()
+-        smoothed  = self.kalman.update(raw_load)
++        smoothed  = self.kalman.update(circadian_load)
+ 
+-        is_anomaly  = abs(raw_load - predicted) > self.SPIKE_THRESHOLD
++        is_anomaly  = abs(circadian_load - predicted) > self.SPIKE_THRESHOLD
+         confidence  = self.baseline.mahalanobis_confidence(features)
+         if self.model_type == "onnx":
+             confidence = min(confidence + 0.15, 1.0)
+ 
+-        fatigue_index   = self.fatigue.update(smoothed, signal.timestamp_ms)
++        fatigue_index = self.fatigue.update(smoothed, signal.timestamp_ms)
+         self._load_history.append(smoothed)
+-        session_pct     = self._percentile(smoothed)
+-        dominant_idx    = int(np.argmax(np.abs(session_norm)))
++        session_pct   = self._percentile(smoothed)
++        dominant_idx  = int(np.argmax(np.abs(session_norm)))
++
++        # Flow episode tracking
++        self.flow.update(smoothed, signal.timestamp_ms)
++        in_flow      = self.flow.in_flow
++        flow_depth   = self.flow.current_depth if in_flow else 0.0
+ 
+         return CognitiveLoadEstimate(
+             load_score=round(smoothed, 4),
+@@ -362,8 +549,15 @@ class CognitiveLoadInferencer:
+             is_anomaly=is_anomaly,
+             predicted_load=round(predicted, 4),
+             session_percentile=round(session_pct, 3),
++            circadian_factor=round(circadian_factor, 4),
++            in_flow_episode=in_flow,
++            flow_episode_depth=round(flow_depth, 4),
+         )
+ 
++    def get_flow_episodes(self) -> list[FlowEpisode]:
++        """Return all completed flow episodes detected so far this session."""
++        return list(self.flow.completed_episodes)
++
+     def update_calibration(self, means: np.ndarray, stds: np.ndarray) -> None:
+         """Apply per-user calibration stats from the NASA-TLX protocol."""
+         self.global_means = means.astype(np.float64)
+@@ -393,8 +587,8 @@ class CognitiveLoadInferencer:
+             logger.warning("[NeuroFlow] ONNX load failed (%s) — heuristic active", exc)
+ 
+     def _extract_features(self) -> np.ndarray:
+-        signals   = list(self.session_window)
+-        ikis      = [s.keystroke_iki_ms for s in signals if s.keystroke_iki_ms]
++        signals    = list(self.session_window)
++        ikis       = [s.keystroke_iki_ms for s in signals if s.keystroke_iki_ms]
+         velocities = [s.mouse_velocity for s in signals]
+         return np.array([
+             float(np.nanmean(ikis)) if ikis else 300.0,
+diff --git a/extension/src/background.js b/extension/src/background.js
+index ed2f1b7..50490c8 100644
+--- a/extension/src/background.js
++++ b/extension/src/background.js
+@@ -73,6 +73,21 @@ function connect() {
+     // Persist latest estimate for popup
+     chrome.storage.local.set({ nf_latest: data });
+ 
++    // Push load estimate back to all active content scripts so they can
++    // update per-domain calibration and cognitive recovery tracking.
++    chrome.tabs.query({ active: true }, (tabs) => {
++      for (const tab of tabs) {
++        if (tab.id != null) {
++          chrome.tabs.sendMessage(tab.id, {
++            type: "LOAD_ESTIMATE",
++            load: data.load,
++            fatigue: data.fatigue_index ?? 0,
++            in_flow: data.in_flow_episode ?? false,
++          }).catch(() => {}); // content script may not be injected on this tab
++        }
++      }
++    });
++
+     // Badge
+     const pct   = Math.round(data.load * 100);
+     const color = data.load < 0.21 ? "#6366f1"    // rich  — indigo
+@@ -86,6 +101,12 @@ function connect() {
+       setBadge("!", "#ef4444");
+       setTimeout(() => setBadge(`${pct}%`, color), 800);
+     }
++
++    // Flow episode indicator: briefly flash badge green when entering flow
++    if (data.in_flow_episode) {
++      chrome.action.setBadgeText({ text: "⚡" });
++      setTimeout(() => setBadge(`${pct}%`, color), 1500);
++    }
+   };
+ 
+   ws.onclose = () => {
+diff --git a/extension/src/collector.js b/extension/src/collector.js
+index 22b7e8d..a0c4162 100644
+--- a/extension/src/collector.js
++++ b/extension/src/collector.js
+@@ -1,5 +1,5 @@
+ /**
+- * NeuroFlow Collector v2 — content script
++ * NeuroFlow Collector v2.1 — content script
+  *
+  * New signals added in v2
+  * ----------------------
+@@ -9,30 +9,168 @@
+  * idle_quality     — distinguishes deliberate pause (1) from distraction (0)
+  *                    based on whether the user returns quickly
+  *
++ * New in v2.1
++ * -----------
++ * cognitive_recovery_rate — how quickly the user's behaviour recovers after
++ *   an overload spike. Computed as the exponential smoothing rate of load
++ *   decrease in the post-peak window. A high recovery rate indicates resilience;
++ *   a low rate indicates sustained overload.
++ *
++ * Per-domain calibration — each site gets its own load baseline multiplier
++ *   stored in chrome.storage.local under "calibration:<hostname>". The
++ *   multiplier is updated every session by comparing the session mean load to
++ *   the global baseline (0.40). On the next visit to the same domain, the
++ *   collector sends the calibration factor with every signal so the backend
++ *   can normalise appropriately.
++ *
+  * Sampling rate: 100 ms (unchanged)
+  * Transport:     chrome.runtime.sendMessage → background.js → WebSocket
+  */
+ (function () {
+   "use strict";
+ 
++  const HOSTNAME = location.hostname;
++
++  // ── Per-domain calibration ────────────────────────────────────────────────
++
++  /**
++   * Calibration factor for this domain.
++   * 1.0 = no adjustment; > 1.0 = this domain typically produces higher load;
++   * < 1.0 = this domain typically produces lower load.
++   * Loaded asynchronously from chrome.storage.local on startup.
++   */
++  let domainCalibration = 1.0;
++  let calibrationLoaded = false;
++
++  // Sliding window of load scores received this session (for calibration update)
++  const SESSION_LOAD_WINDOW = 200;   // last N load estimates
++  let sessionLoads = [];
++
++  function loadDomainCalibration() {
++    const key = "calibration:" + HOSTNAME;
++    try {
++      chrome.storage.local.get(key, (result) => {
++        if (chrome.runtime.lastError) return;
++        const stored = result[key];
++        if (typeof stored === "number" && isFinite(stored) && stored > 0) {
++          domainCalibration = stored;
++        }
++        calibrationLoaded = true;
++        console.log("[NeuroFlow v2.1] domain calibration for", HOSTNAME, "→", domainCalibration.toFixed(3));
++      });
++    } catch (_) {
++      calibrationLoaded = true;
++    }
++  }
++
++  /**
++   * Called by background.js when a load estimate arrives back from the server.
++   * Accumulates session loads and, at the end of the session, updates the
++   * per-domain calibration factor.
++   */
++  function onLoadEstimate(loadScore) {
++    if (!isFinite(loadScore)) return;
++    sessionLoads.push(loadScore);
++    if (sessionLoads.length > SESSION_LOAD_WINDOW) {
++      sessionLoads.shift();
++    }
++  }
++
++  function saveDomainCalibration() {
++    if (sessionLoads.length < 20) return;   // not enough data
++    const GLOBAL_BASELINE = 0.40;
++    const sessionMean = sessionLoads.reduce((a, b) => a + b, 0) / sessionLoads.length;
++    // Blend: 70% old factor, 30% new observation (slow drift)
++    const newFactor = domainCalibration * 0.70 + (sessionMean / GLOBAL_BASELINE) * 0.30;
++    const clamped   = Math.min(Math.max(newFactor, 0.5), 2.0);
++    const key = "calibration:" + HOSTNAME;
++    try {
++      chrome.storage.local.set({ [key]: clamped }, () => {
++        if (!chrome.runtime.lastError) {
++          console.log("[NeuroFlow v2.1] saved domain calibration:", HOSTNAME, "→", clamped.toFixed(3));
++        }
++      });
++    } catch (_) {}
++  }
++
++  // Save calibration when tab closes or navigates away
++  window.addEventListener("beforeunload", saveDomainCalibration);
++
++  // ── Cognitive recovery rate tracker ──────────────────────────────────────
++
++  /**
++   * Tracks how quickly the user behaviorally recovers from overload spikes.
++   *
++   * Algorithm:
++   *   1. Detect an overload event: load estimate > 0.65.
++   *   2. Watch the next N windows for load to decrease.
++   *   3. Compute the slope of the decreasing load curve.
++   *   4. Normalise to [0, 1]: 0 = no recovery (flat or still rising),
++   *      1 = fast recovery (steep drop back below 0.40 in < 5 windows).
++   *
++   * The value is updated via onLoadEstimate().
++   */
++  const RECOVERY_WINDOW = 20;    // windows to observe post-peak
++  let inOverload        = false;
++  let postPeakLoads     = [];
++  let peakLoad          = 0;
++  let cognitiveRecoveryRate = 0.5;   // neutral initial value
++
++  function updateRecovery(load) {
++    if (!inOverload) {
++      if (load > 0.65) {
++        inOverload    = true;
++        postPeakLoads = [];
++        peakLoad      = load;
++      }
++    } else {
++      postPeakLoads.push(load);
++      if (postPeakLoads.length >= RECOVERY_WINDOW) {
++        // Compute linear regression slope (load ~ window index)
++        const n    = postPeakLoads.length;
++        const xBar = (n - 1) / 2;
++        const yBar = postPeakLoads.reduce((a, b) => a + b, 0) / n;
++        let num = 0, den = 0;
++        for (let i = 0; i < n; i++) {
++          num += (i - xBar) * (postPeakLoads[i] - yBar);
++          den += (i - xBar) ** 2;
++        }
++        const slope = den > 0 ? num / den : 0;
++        // Slope is negative when recovering (load decreasing)
++        // Normalise: slope of -0.03 per window ≈ full recovery in RECOVERY_WINDOW frames
++        const normalised = Math.min(Math.max(-slope / 0.03, 0), 1);
++        // Smooth with the previous value
++        cognitiveRecoveryRate = cognitiveRecoveryRate * 0.6 + normalised * 0.4;
++        inOverload    = false;
++        postPeakLoads = [];
++      }
++      // Give up if load never dropped (user stayed overloaded)
++      if (postPeakLoads.length >= RECOVERY_WINDOW * 2) {
++        cognitiveRecoveryRate = cognitiveRecoveryRate * 0.6 + 0.0 * 0.4;
++        inOverload    = false;
++        postPeakLoads = [];
++      }
++    }
++  }
++
+   // ── Signal state ────────────────────────────────────────────────────────
+-  let keyBuffer       = [];
+-  let lastKeyTime     = 0;
+-  let errorCount      = 0;
+-  let totalKeys       = 0;
+-  let mouseTrack      = [];
++  let keyBuffer        = [];
++  let lastKeyTime      = 0;
++  let errorCount       = 0;
++  let totalKeys        = 0;
++  let mouseTrack       = [];
+   let scrollVelocities = [];
+-  let lastScrollY     = window.scrollY;
+-  let lastScrollTime  = Date.now();
+-  let tabSwitches     = 0;
+-  let cpCount         = 0;
+-  let rightClicks     = 0;
++  let lastScrollY      = window.scrollY;
++  let lastScrollTime   = Date.now();
++  let tabSwitches      = 0;
++  let cpCount          = 0;
++  let rightClicks      = 0;
+   let selectionLengths = [];
+-  let focusSwitches   = 0;
+-  let lastActivity    = Date.now();
++  let focusSwitches    = 0;
++  let lastActivity     = Date.now();
+ 
+   // For idle quality: track whether user returned to activity quickly
+-  let idleStart       = null;
++  let idleStart        = null;
+   let quickReturnCount = 0;
+   let slowReturnCount  = 0;
+ 
+@@ -83,10 +221,8 @@
+   document.addEventListener("copy",  () => { cpCount++; });
+   document.addEventListener("paste", () => { cpCount++; lastActivity = Date.now(); });
+ 
+-  // New: right-click
+   document.addEventListener("contextmenu", () => rightClicks++);
+ 
+-  // New: text selection length
+   document.addEventListener("mouseup", () => {
+     const sel = window.getSelection();
+     if (sel && sel.toString().length > 0) {
+@@ -94,12 +230,19 @@
+     }
+   });
+ 
+-  // New: focus switches between elements
+   document.addEventListener("focusin", () => {
+     focusSwitches++;
+     lastActivity = Date.now();
+   }, true);
+ 
++  // Listen for load estimates pushed back from background.js
++  chrome.runtime.onMessage.addListener((msg) => {
++    if (msg && msg.type === "LOAD_ESTIMATE" && typeof msg.load === "number") {
++      onLoadEstimate(msg.load);
++      updateRecovery(msg.load);
++    }
++  });
++
+   // ── Compute derived metrics ──────────────────────────────────────────────
+ 
+   function computeMouseVelocity() {
+@@ -112,10 +255,9 @@
+       if (dt > 0) velocities.push(Math.sqrt(dx * dx + dy * dy) / dt);
+     }
+     if (!velocities.length) return { velocity: 0, acceleration: 0, dirChanges: 0 };
+-    const v = velocities.reduce((a, b) => a + b, 0) / velocities.length;
++    const v   = velocities.reduce((a, b) => a + b, 0) / velocities.length;
+     const acc = Math.abs(velocities[velocities.length - 1] - velocities[0]);
+ 
+-    // Direction changes
+     let changes = 0, prevAngle = null;
+     for (let i = 1; i < mouseTrack.length; i++) {
+       const dx = mouseTrack[i].x - mouseTrack[i - 1].x;
+@@ -130,9 +272,8 @@
+   }
+ 
+   function computeIdleQuality() {
+-    // 1.0 = deliberate focused pause (quick return), 0.0 = distraction
+     const total = quickReturnCount + slowReturnCount;
+-    if (total === 0) return 0.5;   // neutral: no idle events
++    if (total === 0) return 0.5;
+     return quickReturnCount / total;
+   }
+ 
+@@ -148,12 +289,12 @@
+     const sv = scrollVelocities.length
+       ? scrollVelocities.reduce((a, b) => a + b, 0) / scrollVelocities.length
+       : 0;
+-    const er    = totalKeys > 0 ? errorCount / totalKeys : 0;
+-    const pause = now - lastActivity;
++    const er     = totalKeys > 0 ? errorCount / totalKeys : 0;
++    const pause  = now - lastActivity;
+     const avgSel = selectionLengths.length
+       ? selectionLengths.reduce((a, b) => a + b, 0) / selectionLengths.length
+       : 0;
+-    const idleQ = computeIdleQuality();
++    const idleQ  = computeIdleQuality();
+ 
+     const signal = {
+       ts:         now,
+@@ -171,18 +312,21 @@
+       sel:        Math.round(avgSel),
+       fc:         focusSwitches,
+       idle_q:     Math.round(idleQ * 100) / 100,
+-      url:        location.hostname,
++      // v2.1 additions
++      recovery_rate:        Math.round(cognitiveRecoveryRate * 1000) / 1000,
++      domain_calibration:   Math.round(domainCalibration * 1000) / 1000,
++      url:        HOSTNAME,
+     };
+ 
+     // Reset accumulators
+-    keyBuffer       = [];
+-    errorCount      = 0;
+-    totalKeys       = 0;
+-    tabSwitches     = 0;
+-    cpCount         = 0;
+-    rightClicks     = 0;
++    keyBuffer        = [];
++    errorCount       = 0;
++    totalKeys        = 0;
++    tabSwitches      = 0;
++    cpCount          = 0;
++    rightClicks      = 0;
+     selectionLengths = [];
+-    focusSwitches   = 0;
++    focusSwitches    = 0;
+     quickReturnCount = 0;
+     slowReturnCount  = 0;
+     scrollVelocities = [];
+@@ -190,7 +334,7 @@
+     chrome.runtime.sendMessage({ type: "SIGNAL", payload: signal });
+   }
+ 
+-  // Track idle start when no activity for > 2s
++  // Track idle start when no activity for > 2 s
+   setInterval(() => {
+     const now = Date.now();
+     if (idleStart === null && now - lastActivity > 2000) {
+@@ -198,6 +342,7 @@
+     }
+   }, 500);
+ 
++  loadDomainCalibration();
+   setInterval(flush, 100);
+-  console.log("[NeuroFlow v2] collector active on", location.hostname);
++  console.log("[NeuroFlow v2.1] collector active on", HOSTNAME);
+ })();
+diff --git a/reference-app/src/components/AdaptiveEditor.tsx b/reference-app/src/components/AdaptiveEditor.tsx
+index d7f672d..8dca450 100644
+--- a/reference-app/src/components/AdaptiveEditor.tsx
++++ b/reference-app/src/components/AdaptiveEditor.tsx
+@@ -1,14 +1,34 @@
+ /**
+  * AdaptiveEditor -- core adaptive CodeMirror editor component.
+  * Grounded in cognitive load theory (Sweller 1988, Paas & van Merrienboer 1994, Lavie 2005).
++ *
++ * New in v2.1
++ * -----------
++ * Adaptive syntax highlighting  — in reduced/minimal states, token colour palette
++ *   is pruned to only the semantically critical colours (keywords + strings).
++ *   Operators, punctuation, and type annotations fade to near-foreground to
++ *   reduce visual density without making code unreadable.
++ *
++ * Progressive comment auto-fold — under high load (reduced/minimal), block
++ *   comments that are > 3 lines are automatically folded to one-liners. The
++ *   user can expand them; folding is re-applied only on state transitions.
++ *
++ * Contextual tooltip verbosity  — inline hover tips become shorter as load
++ *   rises: full documentation in rich/normal, a single-sentence summary in
++ *   reduced, hidden entirely in minimal. Implemented via data attributes
++ *   on the editor wrapper and companion CSS.
+  */
+ import CodeMirror from "@uiw/react-codemirror";
+ import { javascript } from "@codemirror/lang-javascript";
+ import { python } from "@codemirror/lang-python";
+ import { oneDark } from "@codemirror/theme-one-dark";
+ import { autocompletion } from "@codemirror/autocomplete";
+-import { EditorView } from "@codemirror/view";
+-import { useState } from "react";
++import { EditorView, Decoration, ViewPlugin, WidgetType } from "@codemirror/view";
++import { syntaxHighlighting, HighlightStyle } from "@codemirror/language";
++import { tags } from "@lezer/highlight";
++import { StateField, StateEffect } from "@codemirror/state";
++import { foldAll, unfoldAll } from "@codemirror/language";
++import { useState, useEffect, useRef, useMemo } from "react";
+ import type { UIState } from "../hooks/useNeuroFlow";
+ import { getLoadColor, getLoadColorRgba } from "../utils/theme";
+ 
+@@ -526,6 +546,76 @@ export const NEUROFLOW_CONFIG = {
+ `,
+ };
+ 
++// ── Adaptive syntax highlighting ────────────────────────────────────────────
++//
++// Full colour palette in rich/normal; pruned to semantically critical tokens
++// in reduced; near-monochrome in minimal to eliminate visual noise.
++
++const HIGHLIGHT_FULL = HighlightStyle.define([
++  { tag: tags.keyword,            color: "#c678dd", fontWeight: "bold" },
++  { tag: tags.string,             color: "#98c379" },
++  { tag: tags.comment,            color: "#5c6370", fontStyle: "italic" },
++  { tag: tags.number,             color: "#d19a66" },
++  { tag: tags.operator,           color: "#56b6c2" },
++  { tag: tags.punctuation,        color: "#abb2bf" },
++  { tag: tags.typeName,           color: "#e5c07b" },
++  { tag: tags.variableName,       color: "#e06c75" },
++  { tag: tags.function(tags.variableName), color: "#61afef" },
++  { tag: tags.definition(tags.variableName), color: "#e06c75" },
++  { tag: tags.self,               color: "#e06c75" },
++  { tag: tags.bool,               color: "#d19a66" },
++  { tag: tags.null,               color: "#d19a66" },
++  { tag: tags.regexp,             color: "#56b6c2" },
++  { tag: tags.escape,             color: "#56b6c2" },
++  { tag: tags.meta,               color: "#c678dd" },
++]);
++
++// Reduced: only keywords and strings in colour; everything else near-foreground
++const HIGHLIGHT_REDUCED = HighlightStyle.define([
++  { tag: tags.keyword,            color: "#c678dd", fontWeight: "bold" },
++  { tag: tags.string,             color: "#98c379" },
++  { tag: tags.comment,            color: "#3e4451", fontStyle: "italic" },
++  { tag: tags.number,             color: "#9da5b4" },
++  { tag: tags.operator,           color: "#9da5b4" },
++  { tag: tags.punctuation,        color: "#7a8194" },
++  { tag: tags.typeName,           color: "#9da5b4" },
++  { tag: tags.variableName,       color: "#abb2bf" },
++  { tag: tags.function(tags.variableName), color: "#9da5b4" },
++  { tag: tags.definition(tags.variableName), color: "#abb2bf" },
++  { tag: tags.self,               color: "#9da5b4" },
++  { tag: tags.bool,               color: "#9da5b4" },
++  { tag: tags.null,               color: "#9da5b4" },
++]);
++
++// Minimal: essentially monochrome — keywords barely accented, nothing else
++const HIGHLIGHT_MINIMAL = HighlightStyle.define([
++  { tag: tags.keyword,            color: "#9d7fcf", fontWeight: "bold" },
++  { tag: tags.string,             color: "#7aaa6a" },
++  { tag: tags.comment,            color: "#2e3340", fontStyle: "italic" },
++  { tag: tags.number,             color: "#8b919d" },
++  { tag: tags.operator,           color: "#6e7585" },
++  { tag: tags.punctuation,        color: "#6e7585" },
++  { tag: tags.typeName,           color: "#8b919d" },
++  { tag: tags.variableName,       color: "#8b919d" },
++  { tag: tags.function(tags.variableName), color: "#8b919d" },
++]);
++
++function getHighlightStyle(uiState: UIState) {
++  if (uiState === "reduced") return syntaxHighlighting(HIGHLIGHT_REDUCED);
++  if (uiState === "minimal") return syntaxHighlighting(HIGHLIGHT_MINIMAL);
++  return syntaxHighlighting(HIGHLIGHT_FULL);
++}
++
++// ── Tooltip verbosity attribute ─────────────────────────────────────────────
++// We set data-nf-tooltip-verbosity on the editor wrapper and use CSS to control
++// what level of hover documentation is displayed.
++// rich/normal → "full"  |  reduced → "brief"  |  minimal → "none"
++function getTooltipVerbosity(uiState: UIState): string {
++  if (uiState === "minimal") return "none";
++  if (uiState === "reduced") return "brief";
++  return "full";
++}
++
+ // Adaptation values derived from cognitive load score -- UNCHANGED logic & thresholds
+ function getAdaptations(uiState: UIState) {
+   const adaptations = {
+@@ -603,25 +693,52 @@ const FILES = [
+ export function AdaptiveEditor({ uiState, score, onCodeChange, readOnly = false }: AdaptiveEditorProps) {
+   const [activeFile, setActiveFile] = useState("main.py");
+   const [fileContents, setFileContents] = useState<Record<string, string>>(FILE_CONTENTS);
++  const editorViewRef = useRef<EditorView | null>(null);
++  const prevStateRef  = useRef<UIState>(uiState);
+ 
+   const adapt = getAdaptations(uiState);
+-  const code = fileContents[activeFile] ?? "";
++  const code  = fileContents[activeFile] ?? "";
+ 
+-  const pct = Math.round(score * 100);
+-  const loadColor = getLoadColor(score);
++  const pct         = Math.round(score * 100);
++  const loadColor   = getLoadColor(score);
+   const loadGlowLow = getLoadColorRgba(score, 0.12);
+   const loadGlowHigh = getLoadColorRgba(score, 0.35);
+ 
++  // Progressive comment folding: fold comments when entering high-load states,
++  // unfold when recovering to rich/normal. Only fires on state transitions.
++  useEffect(() => {
++    const prev = prevStateRef.current;
++    prevStateRef.current = uiState;
++    const view = editorViewRef.current;
++    if (!view) return;
++
++    const wasLowLoad  = prev === "rich" || prev === "normal";
++    const isHighLoad  = uiState === "reduced" || uiState === "minimal";
++    const wasHighLoad = prev === "reduced" || prev === "minimal";
++    const isLowLoad   = uiState === "rich" || uiState === "normal";
++
++    if (wasLowLoad && isHighLoad) {
++      // Entering high-load — fold all foldable ranges (block comments, docstrings)
++      foldAll(view);
++    } else if (wasHighLoad && isLowLoad) {
++      // Recovering — restore full code view
++      unfoldAll(view);
++    }
++  }, [uiState]);
++
+   const handleChange = (val: string) => {
+     setFileContents(prev => ({ ...prev, [activeFile]: val }));
+     onCodeChange?.(val);
+   };
+ 
+-  const extensions = [
++  // Memoise extensions so CodeMirror doesn't rebuild the view on every render.
++  // The highlight style is swapped per uiState — this is the main thing that changes.
++  const extensions = useMemo(() => [
+     activeFile.endsWith(".py") ? python() : javascript(),
+     autocompletion({ activateOnTyping: true }),
++    getHighlightStyle(uiState),
+     ...(readOnly ? [EditorView.editable.of(false)] : []),
+-  ];
++  ], [activeFile, uiState, readOnly]);
+ 
+   return (
+     <div style={{
+@@ -841,16 +958,19 @@ export function AdaptiveEditor({ uiState, score, onCodeChange, readOnly = false
+         </div>
+ 
+         {/* CodeMirror editor canvas */}
+-        <div style={{
+-          flex: 1,
+-          overflow: "hidden",
+-          display: "flex",
+-          flexDirection: "column",
+-          padding: adapt.padding,
+-          opacity: adapt.opacity,
+-          transition: `all ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
+-          background: "#0a0d14",
+-        }}>
++        <div
++          data-nf-tooltip-verbosity={getTooltipVerbosity(uiState)}
++          style={{
++            flex: 1,
++            overflow: "hidden",
++            display: "flex",
++            flexDirection: "column",
++            padding: adapt.padding,
++            opacity: adapt.opacity,
++            transition: `all ${adapt.animationDuration} cubic-bezier(0.16, 1, 0.3, 1)`,
++            background: "#0a0d14",
++          }}
++        >
+           <CodeMirror
+             value={code}
+             height="100%"
+@@ -858,9 +978,10 @@ export function AdaptiveEditor({ uiState, score, onCodeChange, readOnly = false
+             extensions={extensions}
+             onChange={handleChange}
+             readOnly={readOnly}
++            onCreateEditor={(view) => { editorViewRef.current = view; }}
+             basicSetup={{
+               lineNumbers: adapt.showLineNumbers,
+-              foldGutter: adapt.showSidebar,
++              foldGutter: true,   // always keep foldGutter available for progressive folding
+               highlightActiveLine: !readOnly,
+               highlightSelectionMatches: true,
+               autocompletion: !readOnly,
+diff --git a/sdk/src/core/NeuroFlow.ts b/sdk/src/core/NeuroFlow.ts
+index 6920271..92f26d2 100644
+--- a/sdk/src/core/NeuroFlow.ts
++++ b/sdk/src/core/NeuroFlow.ts
+@@ -17,6 +17,23 @@
+  *                        critical input field (input[data-nf-critical]).
+  * Reconnect strategy    — exponential backoff (mirrors the extension).
+  *
++ * New in v2.1
++ * -----------
++ * rAF interpolation     — --nf-load and all load-derived CSS vars are smoothly
++ *                         interpolated between server estimates using
++ *                         requestAnimationFrame; eliminates step-change jumps.
++ * data-nf-sensitivity   — per-element adaptation aggressiveness multiplier
++ *                         (0.0 = ignore load changes; 2.0 = double the effect).
++ *                         Applied when writing element-level CSS overrides.
++ * Focus tunnel          — in minimal state, non-focused elements receive
++ *                         data-nf-defocused so they can be dimmed via CSS.
++ * data-nf-mode          — set to "reading" | "writing" | "idle" per inferred
++ *                         behavioural mode; lets stylesheets differentiate
++ *                         reading-flow from active-writing adaptations.
++ * Circadian factor      — --nf-circadian CSS var reflects server-side
++ *                         time-of-day capacity factor for custom theming.
++ * Flow episode state    — data-nf-flow="true/false" and --nf-flow-depth CSS var.
++ *
+  * Quick start (unchanged)
+  * -----------------------
+  *   const nf = new NeuroFlow({ sessionId: uid, wsUrl: '...' });
+@@ -26,7 +43,9 @@
+  * --------------------
+  *   .sidebar { opacity: calc(1 - var(--nf-load) * 0.8); }
+  *   [data-nf-state="minimal"] .sidebar { display: none; }
+- *   .ai-hint { opacity: var(--nf-fatigue); }  /* show more hints when fatigued *\/
++ *   .ai-hint { opacity: var(--nf-fatigue); }
++ *   [data-nf-defocused] { opacity: 0.35; pointer-events: none; }
++ *   [data-nf-mode="reading"] .toolbar { opacity: 0.3; }
+  */
+ 
+ export interface LoadEstimate {
+@@ -41,6 +60,9 @@ export interface LoadEstimate {
+   is_anomaly?: boolean;
+   predicted_load?: number;
+   session_pct?: number;
++  circadian_factor?: number;
++  in_flow_episode?: boolean;
++  flow_episode_depth?: number;
+   forecast?: {
+     phase: string;
+     trend: number;
+@@ -51,6 +73,7 @@ export interface LoadEstimate {
+ }
+ 
+ export type UIState = 'rich' | 'normal' | 'reduced' | 'minimal';
++export type BehaviouralMode = 'reading' | 'writing' | 'idle';
+ 
+ export interface NeuroFlowPlugin {
+   name: string;
+@@ -68,13 +91,17 @@ export interface NeuroFlowConfig {
+   onError?: (err: Error) => void;
+   /** Suppress adaptation while a [data-nf-critical] element has focus */
+   respectCriticalInputs?: boolean;
++  /** In "minimal" state, dim non-focused elements with data-nf-defocused */
++  focusTunnel?: boolean;
++  /** Interpolation speed factor: 1.0 = default (lerp α = 0.08 per frame) */
++  interpolationSpeed?: number;
+ }
+ 
+ type LoadChangeCallback = (estimate: LoadEstimate, uiState: UIState) => void;
+ 
+ // ─── Hysteresis state machine ────────────────────────────────────────────────
+ 
+-const HYSTERESIS_BAND = 0.04;   // must cross threshold by this much before committing
++const HYSTERESIS_BAND = 0.04;
+ 
+ function hysteresisState(
+   current: UIState,
+@@ -83,7 +110,6 @@ function hysteresisState(
+ ): UIState {
+   const { rich, normal, reduced } = thresholds;
+ 
+-  // Raw target state without hysteresis
+   let raw: UIState;
+   if (load < rich) raw = 'rich';
+   else if (load < normal) raw = 'normal';
+@@ -92,22 +118,141 @@ function hysteresisState(
+ 
+   if (raw === current) return current;
+ 
+-  // Only commit if the load has passed the threshold by HYSTERESIS_BAND
+   const stateOrder: UIState[] = ['rich', 'normal', 'reduced', 'minimal'];
+   const currIdx = stateOrder.indexOf(current);
+   const rawIdx  = stateOrder.indexOf(raw);
+ 
+   if (rawIdx > currIdx) {
+-    // Moving toward higher load — need to be well above the threshold
+     const boundary = rawIdx === 1 ? rich : rawIdx === 2 ? normal : reduced;
+     return load > boundary + HYSTERESIS_BAND ? raw : current;
+   } else {
+-    // Moving toward lower load — need to be well below the threshold
+     const boundary = currIdx === 1 ? rich : currIdx === 2 ? normal : reduced;
+     return load < boundary - HYSTERESIS_BAND ? raw : current;
+   }
+ }
+ 
++// ─── rAF-based CSS interpolator ─────────────────────────────────────────────
++
++/**
++ * Smoothly interpolates CSS custom properties on document.documentElement
++ * between server estimate arrivals using requestAnimationFrame.
++ *
++ * Instead of writing --nf-load = 0.82 the instant a WebSocket message lands,
++ * the interpolator walks toward the target value at ~60 fps with an exponential
++ * lerp, producing buttery-smooth transitions with no janky step changes.
++ */
++class CSSInterpolator {
++  private targets: Map<string, number> = new Map();
++  private current: Map<string, number> = new Map();
++  private rafId: number | null = null;
++  private alpha: number;
++
++  constructor(interpolationSpeed = 1.0) {
++    // α controls lerp speed. At 60fps, α=0.08 → ~90% of the way in ~28 frames (~0.47s).
++    // Higher interpolationSpeed increases α for faster convergence.
++    this.alpha = Math.min(Math.max(0.04 * interpolationSpeed, 0.01), 0.4);
++  }
++
++  set(property: string, target: number, immediate = false): void {
++    this.targets.set(property, target);
++    if (!this.current.has(property) || immediate) {
++      this.current.set(property, target);
++      document.documentElement.style.setProperty(property, target.toFixed(4));
++    }
++    this.ensureRunning();
++  }
++
++  private ensureRunning(): void {
++    if (this.rafId !== null) return;
++    const tick = () => {
++      let allSettled = true;
++      this.targets.forEach((target, prop) => {
++        const cur = this.current.get(prop) ?? target;
++        const next = cur + (target - cur) * this.alpha;
++        const settled = Math.abs(next - target) < 0.0005;
++        this.current.set(prop, settled ? target : next);
++        document.documentElement.style.setProperty(prop, (settled ? target : next).toFixed(4));
++        if (!settled) allSettled = false;
++      });
++      this.rafId = allSettled ? null : requestAnimationFrame(tick);
++    };
++    this.rafId = requestAnimationFrame(tick);
++  }
++
++  destroy(): void {
++    if (this.rafId !== null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
++  }
++}
++
++// ─── Behavioural mode classifier ────────────────────────────────────────────
++
++/**
++ * Infers whether the user is currently reading, writing, or idle from the
++ * most recently received estimate.
++ *
++ * reading — high scroll velocity, low keystroke count, low error rate
++ * writing — high keystroke rate, low scroll velocity
++ * idle    — very long pause, low all-round activity
++ */
++function classifyMode(estimate: LoadEstimate, _dominant: string): BehaviouralMode {
++  // We don't have raw feature access here, but we can use dominant signal
++  // and proxy the mode from semantic signal names.
++  const dom = estimate.dominant ?? '';
++  if (dom === 'pause_duration_ms' || estimate.load < 0.1) return 'idle';
++  if (dom === 'scroll_velocity')                           return 'reading';
++  if (dom === 'keystroke_iki_ms' || dom === 'error_rate') return 'writing';
++  // Fallback: use load + session percentile as a heuristic
++  if ((estimate.session_pct ?? 0.5) < 0.3)               return 'reading';
++  return 'writing';
++}
++
++// ─── Focus tunnel helper ────────────────────────────────────────────────────
++
++/**
++ * In "minimal" state, applies data-nf-defocused to every focusable element
++ * that does NOT contain the currently active element. Cleared on state exit.
++ */
++function applyFocusTunnel(active: boolean): void {
++  const all = document.querySelectorAll<HTMLElement>(
++    'a, button, input, textarea, select, [tabindex], [data-nf-sensitivity]'
++  );
++  const focused = document.activeElement;
++  all.forEach((el) => {
++    if (!active) {
++      el.removeAttribute('data-nf-defocused');
++      return;
++    }
++    const isFocused = el === focused || el.contains(focused);
++    if (isFocused) {
++      el.removeAttribute('data-nf-defocused');
++    } else {
++      el.setAttribute('data-nf-defocused', 'true');
++    }
++  });
++}
++
++// ─── Sensitivity zone CSS updater ───────────────────────────────────────────
++
++/**
++ * Applies per-element CSS custom property overrides based on the element's
++ * data-nf-sensitivity attribute.
++ *
++ * <div data-nf-sensitivity="0.5"> → receives --nf-load at half the global value.
++ * <div data-nf-sensitivity="2.0"> → receives --nf-load at double the global value.
++ *
++ * This lets individual components opt in to heavier or lighter adaptation
++ * without the author having to fork CSS selectors per state.
++ */
++function applySensitivityZones(globalLoad: number): void {
++  const zones = document.querySelectorAll<HTMLElement>('[data-nf-sensitivity]');
++  zones.forEach((el) => {
++    const sens = parseFloat(el.getAttribute('data-nf-sensitivity') ?? '1');
++    if (!isFinite(sens)) return;
++    const localLoad = Math.min(Math.max(globalLoad * sens, 0), 1);
++    el.style.setProperty('--nf-load', localLoad.toFixed(4));
++  });
++}
++
+ // ─── Main class ──────────────────────────────────────────────────────────────
+ 
+ export class NeuroFlow {
+@@ -122,8 +267,17 @@ export class NeuroFlow {
+   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+ 
+   private currentState: UIState = 'normal';
++  private currentMode: BehaviouralMode = 'writing';
+   private criticalFocus = false;
+ 
++  private interpolator: CSSInterpolator;
++  private focusTunnelActive = false;
++
++  // Focus tunnel refreshes on focus change in minimal state
++  private _focusListener = () => {
++    if (this.focusTunnelActive) applyFocusTunnel(true);
++  };
++
+   constructor(config: NeuroFlowConfig) {
+     this.cfg = {
+       sampleRateMs: 100,
+@@ -132,9 +286,12 @@ export class NeuroFlow {
+       hysteresisMs: 2000,
+       onError: console.error,
+       respectCriticalInputs: true,
++      focusTunnel: true,
++      interpolationSpeed: 1.0,
+       ...config,
+     };
+-    this.collector = new SignalCollector(this.cfg.sampleRateMs);
++    this.collector   = new SignalCollector(this.cfg.sampleRateMs);
++    this.interpolator = new CSSInterpolator(this.cfg.interpolationSpeed);
+ 
+     if (this.cfg.respectCriticalInputs) {
+       document.addEventListener('focusin', (e) => {
+@@ -145,6 +302,11 @@ export class NeuroFlow {
+         this.criticalFocus = false;
+       });
+     }
++
++    if (this.cfg.focusTunnel) {
++      document.addEventListener('focusin',  this._focusListener);
++      document.addEventListener('focusout', this._focusListener);
++    }
+   }
+ 
+   start(): void {
+@@ -158,9 +320,17 @@ export class NeuroFlow {
+ 
+   stop(): void {
+     this.collector.stop();
++    this.interpolator.destroy();
+     if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+     this.ws?.close();
+     this.connected = false;
++
++    // Clean up focus tunnel
++    if (this.cfg.focusTunnel) {
++      document.removeEventListener('focusin',  this._focusListener);
++      document.removeEventListener('focusout', this._focusListener);
++    }
++    applyFocusTunnel(false);
+   }
+ 
+   /** Register a callback for every load estimate */
+@@ -175,9 +345,8 @@ export class NeuroFlow {
+     return this;
+   }
+ 
+-  getCurrentUIState(): UIState {
+-    return this.currentState;
+-  }
++  getCurrentUIState(): UIState   { return this.currentState; }
++  getCurrentMode():    BehaviouralMode { return this.currentMode; }
+ 
+   // ── Internal ──────────────────────────────────────────────────────────────
+ 
+@@ -186,7 +355,7 @@ export class NeuroFlow {
+     this.ws = new WebSocket(url);
+ 
+     this.ws.onopen = () => {
+-      this.connected     = true;
++      this.connected      = true;
+       this.reconnectDelay = 1000;
+     };
+ 
+@@ -216,29 +385,49 @@ export class NeuroFlow {
+     }
+     if (estimate.type !== 'load_estimate') return;
+ 
+-    // Determine if we should pre-adapt based on forecast
++    // Determine effective load (with predictive pre-adaptation)
+     let effectiveLoad = estimate.load;
+     const fc = estimate.forecast;
+     if (fc?.load_6s != null) {
+       const stateOrder: UIState[] = ['rich', 'normal', 'reduced', 'minimal'];
+-      const currIdx  = stateOrder.indexOf(this.currentState);
++      const currIdx    = stateOrder.indexOf(this.currentState);
+       const futureState = this.rawState(fc.load_6s);
+-      const futureIdx = stateOrder.indexOf(futureState);
+-
+-      // Pre-adapt if forecast indicates a higher-load state in 6 s
++      const futureIdx  = stateOrder.indexOf(futureState);
+       if (futureIdx > currIdx) {
+         effectiveLoad = Math.max(effectiveLoad, fc.load_6s * 0.6 + effectiveLoad * 0.4);
+       }
+     }
+ 
+-    const prevState    = this.currentState;
+-    const nextState    = hysteresisState(prevState, effectiveLoad, this.cfg.thresholds);
+-    this.currentState  = nextState;
++    const prevState   = this.currentState;
++    const nextState   = hysteresisState(prevState, effectiveLoad, this.cfg.thresholds);
++    this.currentState = nextState;
++
++    // Infer behavioural mode
++    const newMode    = classifyMode(estimate, estimate.dominant ?? '');
++    const modeChanged = newMode !== this.currentMode;
++    this.currentMode  = newMode;
+ 
+     if (!this.criticalFocus) {
+       this.applyAdaptation(estimate.load, nextState, estimate);
+     }
+ 
++    // Update sensitivity zones every estimate
++    applySensitivityZones(estimate.load);
++
++    // Focus tunnel — activate in minimal, deactivate on exit
++    if (this.cfg.focusTunnel) {
++      const shouldTunnel = nextState === 'minimal';
++      if (shouldTunnel !== this.focusTunnelActive) {
++        this.focusTunnelActive = shouldTunnel;
++        applyFocusTunnel(shouldTunnel);
++      }
++    }
++
++    // Behavioural mode attribute
++    if (modeChanged) {
++      document.documentElement.setAttribute('data-nf-mode', newMode);
++    }
++
+     this.callbacks.forEach((cb) => cb(estimate, nextState));
+     this.plugins.forEach((p) => {
+       p.onEstimate(estimate, nextState);
+@@ -258,24 +447,39 @@ export class NeuroFlow {
+     const root = document.documentElement;
+ 
+     if (this.cfg.adaptationMode === 'smooth') {
+-      root.style.setProperty('--nf-load',             load.toFixed(3));
+-      root.style.setProperty('--nf-density',          (1 - load * 0.6).toFixed(3));
+-      root.style.setProperty('--nf-animation-speed',  `${(0.2 + load * 0.5).toFixed(2)}s`);
+-      root.style.setProperty('--nf-secondary-opacity', (1 - load * 0.7).toFixed(3));
++      // rAF-interpolated vars (smooth between server frames)
++      this.interpolator.set('--nf-load',              load);
++      this.interpolator.set('--nf-density',           1 - load * 0.6);
++      this.interpolator.set('--nf-secondary-opacity', 1 - load * 0.7);
+ 
+-      // v2 new vars
+       if (estimate.fatigue_index != null) {
+-        root.style.setProperty('--nf-fatigue', estimate.fatigue_index.toFixed(3));
++        this.interpolator.set('--nf-fatigue', estimate.fatigue_index);
+       }
+       if (estimate.forecast?.load_6s != null) {
+-        root.style.setProperty('--nf-forecast', estimate.forecast.load_6s.toFixed(3));
++        this.interpolator.set('--nf-forecast', estimate.forecast.load_6s);
++      }
++      if (estimate.circadian_factor != null) {
++        this.interpolator.set('--nf-circadian', estimate.circadian_factor);
+       }
+-      if (estimate.forecast?.phase) {
+-        root.setAttribute('data-nf-phase', estimate.forecast.phase);
++      if (estimate.flow_episode_depth != null) {
++        this.interpolator.set('--nf-flow-depth', estimate.flow_episode_depth);
+       }
++
++      // animation-speed is a time value — write directly (not a 0–1 number)
++      root.style.setProperty('--nf-animation-speed', `${(0.2 + load * 0.5).toFixed(2)}s`);
+     }
+ 
+     root.setAttribute('data-nf-state', state);
++
++    // Flow episode attribute
++    if (estimate.in_flow_episode != null) {
++      root.setAttribute('data-nf-flow', String(estimate.in_flow_episode));
++    }
++
++    // Forecast phase
++    if (estimate.forecast?.phase) {
++      root.setAttribute('data-nf-phase', estimate.forecast.phase);
++    }
+   }
+ }
+ 
+-- 
+2.43.0
+

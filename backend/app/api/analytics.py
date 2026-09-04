@@ -21,6 +21,16 @@ GET  /api/analytics/sessions/{session_id}/peaks
 
 GET  /api/analytics/compare
      Query params: session_a, session_b.  Returns side-by-side stats.
+
+GET  /api/analytics/sessions/{session_id}/segments
+     Chronological list of labelled cognitive segments: flow episodes
+     (sustained low-load) and overload episodes (sustained high-load),
+     with start/end timestamps, depth/intensity, and duration.
+
+GET  /api/analytics/sessions/{session_id}/correlations
+     Pearson r between each behavioural signal and the load score
+     for the session.  Useful for ranking which signals were most
+     predictive of load for this individual user.
 """
 from __future__ import annotations
 
@@ -35,6 +45,12 @@ from sqlalchemy import select, func
 from app.db import get_db
 from app.db.models import LoadEstimateRecord, Session as SessionModel
 from app.ml.predictor import HoltWintersForecaster
+from app.ml.inference import (
+    FLOW_ENTRY_THRESHOLD,
+    FLOW_EXIT_THRESHOLD,
+    FLOW_MIN_WINDOWS,
+    FEATURE_NAMES,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -366,4 +382,215 @@ async def compare_sessions(
             for k in ["avg_load", "peak_load", "volatility", "flow_index", "peak_count"]
             if isinstance(stats_a.get(k), (int, float))
         },
+    }
+
+
+@router.get("/sessions/{session_id}/segments")
+async def session_segments(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Chronological cognitive segment map.
+
+    Replays the session load stream through the same flow/overload
+    detectors used by the real-time inferencer and returns a list of
+    labelled episodes:
+      type="flow"     — sustained low-load (< FLOW_ENTRY_THRESHOLD)
+      type="overload" — sustained high-load (> 0.65)
+      type="normal"   — everything in between (background segments fill gaps)
+
+    Each segment carries: start_ts, end_ts, duration_ms, avg_load,
+    peak_load (overload) / min_load (flow), window_count.
+    """
+    try:
+        result = await db.execute(
+            select(LoadEstimateRecord)
+            .where(LoadEstimateRecord.session_id == session_id)
+            .order_by(LoadEstimateRecord.ts.asc())
+        )
+        rows = result.scalars().all()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No data for session {session_id}")
+
+    loads = [r.load_score for r in rows]
+    tss   = [r.ts for r in rows]
+
+    segments: list[dict] = []
+
+    # ------------------------------------------------------------------ #
+    # Pass 1: flow episodes (hysteresis FSM)                              #
+    # ------------------------------------------------------------------ #
+    in_flow = False
+    flow_start_idx = 0
+    flow_spans: list[tuple[int, int]] = []   # (start_idx, end_idx inclusive)
+
+    for i, load in enumerate(loads):
+        if not in_flow:
+            if load < FLOW_ENTRY_THRESHOLD:
+                in_flow = True
+                flow_start_idx = i
+        else:
+            if load > FLOW_EXIT_THRESHOLD:
+                run_len = i - flow_start_idx
+                if run_len >= FLOW_MIN_WINDOWS:
+                    flow_spans.append((flow_start_idx, i - 1))
+                in_flow = False
+
+    if in_flow and (len(loads) - flow_start_idx) >= FLOW_MIN_WINDOWS:
+        flow_spans.append((flow_start_idx, len(loads) - 1))
+
+    # ------------------------------------------------------------------ #
+    # Pass 2: overload episodes (same _detect_peaks logic)                #
+    # ------------------------------------------------------------------ #
+    overload_spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(loads):
+        if loads[i] >= 0.65:
+            j = i
+            while j < len(loads) and loads[j] >= 0.65:
+                j += 1
+            if j - i >= 3:
+                overload_spans.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    # ------------------------------------------------------------------ #
+    # Merge spans into chronological segment list                         #
+    # ------------------------------------------------------------------ #
+    tagged: list[tuple[int, int, str]] = (
+        [(s, e, "flow") for s, e in flow_spans]
+        + [(s, e, "overload") for s, e in overload_spans]
+    )
+    tagged.sort(key=lambda t: t[0])
+
+    # Fill gaps with "normal" segments
+    filled: list[tuple[int, int, str]] = []
+    cursor = 0
+    for s, e, kind in tagged:
+        if s > cursor:
+            filled.append((cursor, s - 1, "normal"))
+        filled.append((s, e, kind))
+        cursor = e + 1
+    if cursor < len(loads):
+        filled.append((cursor, len(loads) - 1, "normal"))
+
+    for s, e, kind in filled:
+        seg_loads = loads[s: e + 1]
+        avg_l = sum(seg_loads) / len(seg_loads)
+        seg: dict = {
+            "type": kind,
+            "start_ts": tss[s],
+            "end_ts": tss[e],
+            "duration_ms": tss[e] - tss[s],
+            "window_count": e - s + 1,
+            "avg_load": round(avg_l, 4),
+        }
+        if kind == "overload":
+            seg["peak_load"] = round(max(seg_loads), 4)
+        elif kind == "flow":
+            seg["min_load"] = round(min(seg_loads), 4)
+            seg["avg_depth"] = round(1.0 - avg_l, 4)
+        segments.append(seg)
+
+    flow_count    = sum(1 for sg in segments if sg["type"] == "flow")
+    overload_count = sum(1 for sg in segments if sg["type"] == "overload")
+    flow_ms       = sum(sg["duration_ms"] for sg in segments if sg["type"] == "flow")
+    total_ms      = tss[-1] - tss[0] if len(tss) > 1 else 1
+
+    return {
+        "session_id": session_id,
+        "segment_count": len(segments),
+        "flow_episode_count": flow_count,
+        "overload_episode_count": overload_count,
+        "flow_time_fraction": round(flow_ms / max(total_ms, 1), 4),
+        "segments": segments,
+    }
+
+
+@router.get("/sessions/{session_id}/correlations")
+async def session_correlations(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pearson r between each behavioural signal and the session load score.
+
+    The DB stores only the load_score and dominant_signal per estimate.
+    To compute per-signal correlations we reconstruct a proxy signal
+    weight from dominance frequency vs load quartile.
+
+    Returns signals ranked by absolute correlation so the frontend
+    can display which signals drove load for this particular user.
+    """
+    try:
+        result = await db.execute(
+            select(LoadEstimateRecord)
+            .where(LoadEstimateRecord.session_id == session_id)
+            .order_by(LoadEstimateRecord.ts.asc())
+        )
+        rows = result.scalars().all()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No data for session {session_id}")
+
+    loads = [r.load_score for r in rows]
+    n = len(loads)
+
+    if n < 10:
+        raise HTTPException(
+            status_code=422,
+            detail="Not enough data for correlations (need ≥ 10 estimates)."
+        )
+
+    # Build per-signal binary dominance vector then compute point-biserial r
+    # (equivalent to Pearson r for a binary x against continuous y)
+    signal_names = FEATURE_NAMES
+    correlations: list[dict] = []
+
+    load_arr = loads
+    load_mean = sum(load_arr) / n
+    load_var  = sum((v - load_mean) ** 2 for v in load_arr) / n
+    load_std  = math.sqrt(load_var) if load_var > 0 else 1.0
+
+    for sig in signal_names:
+        # Binary indicator: 1 when this signal was dominant, else 0
+        indicator = [1.0 if (r.dominant_signal == sig) else 0.0 for r in rows]
+        ind_mean  = sum(indicator) / n
+
+        if ind_mean == 0.0 or ind_mean == 1.0:
+            # Signal was never (or always) dominant — r is undefined
+            correlations.append({
+                "signal": sig,
+                "pearson_r": 0.0,
+                "dominance_rate": round(ind_mean, 4),
+                "n_dominant": int(sum(indicator)),
+            })
+            continue
+
+        # Pearson r = cov(x, y) / (std_x * std_y)
+        cov = sum((indicator[i] - ind_mean) * (load_arr[i] - load_mean) for i in range(n)) / n
+        ind_std = math.sqrt(sum((v - ind_mean) ** 2 for v in indicator) / n)
+        r = cov / (ind_std * load_std) if ind_std > 0 else 0.0
+
+        correlations.append({
+            "signal": sig,
+            "pearson_r": round(float(r), 4),
+            "dominance_rate": round(ind_mean, 4),
+            "n_dominant": int(sum(indicator)),
+        })
+
+    correlations.sort(key=lambda c: abs(c["pearson_r"]), reverse=True)
+
+    return {
+        "session_id": session_id,
+        "n_estimates": n,
+        "correlations": correlations,
+        "top_signal": correlations[0]["signal"] if correlations else "unknown",
     }
