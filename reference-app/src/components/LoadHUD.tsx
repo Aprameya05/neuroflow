@@ -12,6 +12,12 @@ interface LoadHUDProps {
   modelType: string;
   isConnected: boolean;
   history: number[];
+  forecast: {
+    load_6s?: number;
+    [key: string]: unknown;
+  } | null;
+  fatigueIndex: number;
+  isAnomaly: boolean;
   visible: boolean;
   isWatchMode?: boolean;
   forcedState?: UIState | null;
@@ -94,7 +100,20 @@ function HardwareSparkline({ history, loadColor }: { history: number[]; loadColo
   );
 }
 
-export function LoadHUD({ score, uiState, dominant, modelType, isConnected, history, visible, isWatchMode, forcedState }: LoadHUDProps) {
+export function LoadHUD({
+  score,
+  uiState,
+  dominant,
+  modelType,
+  isConnected,
+  history,
+  forecast,
+  fatigueIndex,
+  isAnomaly,
+  visible,
+  isWatchMode,
+  forcedState
+}: LoadHUDProps) {
   if (!visible) return null;
 
   const pct = Math.round(score * 100);
@@ -103,23 +122,58 @@ export function LoadHUD({ score, uiState, dominant, modelType, isConnected, hist
   const loadGlowLow = getLoadColorRgba(score, 0.15);
   const loadGlowHigh = getLoadColorRgba(score, 0.35);
 
+  const predictedLoad = forecast?.load_6s ?? null;
+
+  const trend =
+    predictedLoad === null
+      ? "→"
+      : predictedLoad > score + 0.03
+        ? "↑"
+        : predictedLoad < score - 0.03
+          ? "↓"
+          : "→";
+
+  const predictedState = predictedLoad === null
+    ? null
+    : predictedLoad < 0.21
+      ? "RICH"
+      : predictedLoad < 0.35
+        ? "NORMAL"
+        : predictedLoad < 0.65
+          ? "REDUCED"
+          : "MINIMAL";
+
   return (
-    <div style={{
-      position: "fixed",
-      bottom: 24,
-      right: 24,
-      background: "rgba(10, 13, 20, 0.82)",
-      border: `1px solid ${loadGlowHigh}`,
-      borderRadius: 14,
-      padding: "14px 16px",
-      width: 228,
-      backdropFilter: "blur(16px) saturate(180%)",
-      zIndex: 1000,
-      boxShadow: `0 20px 40px rgba(0, 0, 0, 0.6), 0 0 30px ${loadGlowLow}`,
-      transition: "all 0.5s cubic-bezier(0.16, 1, 0.3, 1)",
-      fontFamily: "'Inter', sans-serif",
-      userSelect: "none",
-    }}>
+    <>
+      <style>{`
+        @keyframes neuroflow-anomaly-pulse {
+          0%, 100% {
+            opacity: 1;
+            transform: scale(1);
+          }
+          50% {
+            opacity: 0.35;
+            transform: scale(1.5);
+          }
+        }
+      `}</style>
+
+      <div style={{
+        position: "fixed",
+        bottom: 24,
+        right: 24,
+        background: "rgba(10, 13, 20, 0.82)",
+        border: `1px solid ${loadGlowHigh}`,
+        borderRadius: 14,
+        padding: "14px 16px",
+        width: 228,
+        backdropFilter: "blur(16px) saturate(180%)",
+        zIndex: 1000,
+        boxShadow: `0 20px 40px rgba(0, 0, 0, 0.6), 0 0 30px ${loadGlowLow}`,
+        transition: "all 0.5s cubic-bezier(0.16, 1, 0.3, 1)",
+        fontFamily: "'Inter', sans-serif",
+        userSelect: "none",
+      }}>
       {/* Sci-fi top hardware bar & corner accents */}
       <div style={{
         display: "flex",
@@ -137,6 +191,21 @@ export function LoadHUD({ score, uiState, dominant, modelType, isConnected, hist
             background: isConnected ? "#34d399" : "#f87171",
             boxShadow: isConnected ? "0 0 8px #34d399" : "0 0 8px #f87171",
           }} />
+
+          {isAnomaly && (
+            <div
+              title="Anomalous cognitive-load pattern detected"
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: "50%",
+                background: "#ef4444",
+                boxShadow: "0 0 8px #ef4444",
+                animation: "neuroflow-anomaly-pulse 1s ease-in-out infinite",
+              }}
+            />
+          )}
+
           <span style={{
             fontSize: 9,
             fontWeight: 800,
@@ -192,6 +261,25 @@ export function LoadHUD({ score, uiState, dominant, modelType, isConnected, hist
           }}>
             {pct}
           </span>
+
+          <span
+            title={
+              predictedLoad === null
+                ? "No forecast available"
+                : `Predicted load: ${Math.round(predictedLoad * 100)}%`
+            }
+            style={{
+              fontSize: 20,
+              fontWeight: 800,
+              color: loadColor,
+              marginLeft: 8,
+              fontFamily: "'JetBrains Mono', monospace",
+              lineHeight: 1,
+            }}
+          >
+            {trend}
+          </span>
+
           <span style={{
             fontSize: 14,
             fontWeight: 600,
@@ -217,6 +305,31 @@ export function LoadHUD({ score, uiState, dominant, modelType, isConnected, hist
         }}>
           {info.label}
         </div>
+
+        {predictedState && (
+          <div
+            title={
+              predictedLoad === null
+                ? "No forecast available"
+                : `Predicted state at 6s: ${predictedState}`
+            }
+            style={{
+              marginLeft: 6,
+              padding: "3px 7px",
+              borderRadius: 20,
+              background: "rgba(99, 102, 241, 0.12)",
+              border: "1px solid rgba(99, 102, 241, 0.25)",
+              color: "#a5b4fc",
+              fontSize: 8,
+              fontWeight: 700,
+              letterSpacing: "0.06em",
+              whiteSpace: "nowrap",
+            }}
+          >
+            NEXT: {predictedState}
+          </div>
+        )}
+
       </div>
 
       {/* Dynamic progress meter bar */}
@@ -238,6 +351,37 @@ export function LoadHUD({ score, uiState, dominant, modelType, isConnected, hist
         }} />
       </div>
 
+      {/* Fatigue meter */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 5,
+          fontSize: 8,
+          fontWeight: 700,
+          letterSpacing: "0.08em",
+          color: "rgba(255, 255, 255, 0.5)",
+        }}>
+          <span>FATIGUE</span>
+          <span>{Math.round(fatigueIndex * 100)}%</span>
+        </div>
+
+        <div style={{
+          height: 3,
+          background: "rgba(255, 255, 255, 0.08)",
+          borderRadius: 2,
+          overflow: "hidden",
+        }}>
+          <div style={{
+            height: "100%",
+            width: `${Math.max(0, Math.min(1, fatigueIndex)) * 100}%`,
+            background: "linear-gradient(90deg, #34d399 0%, #f59e0b 60%, #ef4444 100%)",
+            borderRadius: 2,
+            transition: "width 0.4s ease",
+          }} />
+        </div>
+      </div>
       {/* Sparkline chart */}
       <div style={{ marginBottom: 12 }}>
         <HardwareSparkline history={history} loadColor={loadColor} />
@@ -273,6 +417,7 @@ export function LoadHUD({ score, uiState, dominant, modelType, isConnected, hist
       }}>
         {info.desc}
       </div>
-    </div>
+        </div>
+  </>
   );
 }

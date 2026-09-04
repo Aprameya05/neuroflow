@@ -428,6 +428,9 @@ export default function App() {
         modelType={load.modelType}
         isConnected={load.isConnected}
         history={load.history}
+        forecast={load.forecast}
+        fatigueIndex={load.fatigueIndex}
+        isAnomaly={load.isAnomaly}
         visible={showHUD}
         isWatchMode={IS_WATCH_MODE}
         forcedState={forcedState}

@@ -30,6 +30,12 @@ export interface LoadState {
   isConnected: boolean;
   isWatchMode: boolean;
   history: number[];
+  forecast: {
+    load_6s?: number;
+    [key: string]: unknown;
+  } | null;
+  fatigueIndex: number;
+  isAnomaly: boolean;
 }
 
 export interface UseNeuroFlowOptions {
@@ -163,6 +169,9 @@ export function useNeuroFlow(
     isConnected: false,
     isWatchMode: watchMode,
     history: [],
+    forecast: null,
+    fatigueIndex: 0,
+    isAnomaly: false,
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -224,6 +233,10 @@ export function useNeuroFlow(
       if (msg.type !== "load_estimate") return;
       if (!warmupDone.current) return;
 
+      const forecast = msg.forecast ?? null;
+      const fatigueIndex = typeof msg.fatigue_index === "number" ? msg.fatigue_index : 0;
+      const isAnomaly = msg.is_anomaly === true;
+
       // EMA smoothing
       smoothedScore.current = EMA_ALPHA * msg.load + (1 - EMA_ALPHA) * smoothedScore.current;
       const smoothed = Math.round(smoothedScore.current * 1000) / 1000;
@@ -247,6 +260,9 @@ export function useNeuroFlow(
         modelType: msg.model_type ?? "heuristic",
         isConnected: true,
         history: [...s.history, smoothed].slice(-60),
+        forecast,
+        fatigueIndex,
+        isAnomaly,
       }));
     };
 

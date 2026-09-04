@@ -17,6 +17,13 @@ function getColor(load) {
   return { text: "#b91c1c", bg: "#fef2f2", label: "Overloaded" };
 }
 
+function getFatigueLabel(fatigueIndex) {
+  if (fatigueIndex >= 0.8) return "High Fatigue";
+  if (fatigueIndex >= 0.6) return "Moderate Fatigue";
+  if (fatigueIndex >= 0.3) return "Early Fatigue";
+  return "Low Fatigue";
+}
+
 function update() {
   chrome.storage.local.get(["latestEstimate", "sessionId"], (data) => {
     const e = data.latestEstimate;
@@ -24,6 +31,9 @@ function update() {
 
     const pct = Math.round(e.load * 100);
     const c = getColor(e.load);
+
+    const anomalyBanner = document.getElementById("anomaly-banner");
+    anomalyBanner.style.display = e.is_anomaly ? "block" : "none";
 
     document.getElementById("load-number").textContent = pct + "%";
     document.getElementById("load-number").style.color = c.text;
@@ -36,6 +46,7 @@ function update() {
     document.getElementById("signals").innerHTML = `
       <div class="signal-row"><span>Dominant signal</span><span>${SIGNAL_LABELS[e.dominant] ?? e.dominant}</span></div>
       <div class="signal-row"><span>Confidence</span><span>${Math.round(e.confidence * 100)}%</span></div>
+      <div class="signal-row"><span>Fatigue</span><span>${getFatigueLabel(e.fatigue_index ?? 0)}</span></div>
       <div class="signal-row"><span>Session</span><span>${(data.sessionId ?? "").slice(0, 8)}…</span></div>
     `;
   });
@@ -49,3 +60,7 @@ function update() {
 
 update();
 setInterval(update, 500);
+
+document.getElementById("reset-session").addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "RESET_SESSION" });
+});
