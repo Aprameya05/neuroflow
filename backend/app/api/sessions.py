@@ -26,7 +26,40 @@ class SessionStart(BaseModel):
 class SessionEnd(BaseModel):
     session_id: str
 
+@router.get("/user/{user_id}")
+async def get_user_sessions(
+    user_id: str,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return recent sessions for a user, newest first."""
+    try:
+        result = await db.execute(
+            select(SessionModel)
+            .where(SessionModel.user_id == user_id)
+            .order_by(SessionModel.started_at.desc())
+            .limit(limit)
+        )
+        sessions = result.scalars().all()
 
+        return {
+            "user_id": user_id,
+            "sessions": [
+                {
+                    "session_id": session.id,
+                    "started_at": session.started_at,
+                    "ended_at": session.ended_at,
+                    "app_context": session.app_context,
+                }
+                for session in sessions
+            ],
+        }
+    except Exception as e:
+        logger.warning("Could not retrieve sessions for user %s: %s", user_id, e)
+        return {
+            "user_id": user_id,
+            "sessions": [],
+        }
 @router.post("/start")
 async def start_session(body: SessionStart, db: AsyncSession = Depends(get_db)):
     session_id = str(uuid.uuid4())

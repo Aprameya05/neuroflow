@@ -19,8 +19,16 @@ import { loadColor, loadColorRgba } from "./utils/colors";
 import type { LoadEstimate } from "./types";
 import { NBackTask } from "./components/NBackTask";
 import { FatigueAlert } from "./components/FatigueAlert";
+import { SessionCalendar } from "./components/SessionCalendar";
+import { CorrelationMatrix } from "./components/CorrelationMatrix";
+import { InterventionManager } from "./components/InterventionManager";
+import {
+  ArchetypeCard,
+  classifyArchetype,
+  ARCHETYPES,
+} from "./components/ArchetypeCard";
 
-type View = "monitor" | "calibration" | "about";
+type View = "monitor" | "calendar" | "profile" | "calibration" | "about";
 
 const SESSION_ID = (() => {
   const stored = sessionStorage.getItem("nf-dashboard-session");
@@ -128,7 +136,9 @@ function StatCard({ label, value, color, glow }: {
 
 const NAV_ITEMS = [
   { id: "monitor",     icon: "◈", label: "Live Monitor" },
-  { id: "calibration", icon: "⬡", label: "Calibration" },
+  { id: "calendar",    icon: "▦", label: "Session Calendar" },
+  { id: "profile",     icon: "◎", label: "Behavioural Profile" },
+  { id: "calibration", icon: "◉", label: "Calibration" },
   { id: "about",       icon: "◉", label: "About" },
 ] as const;
 
@@ -142,6 +152,31 @@ export default function App() {
   const { estimates: liveEstimates, currentLoad: liveLoad, isConnected } = useNeuroFlowSocket(sessionId);
 
   const [showReplay, setShowReplay] = useState(false);
+
+  const [profileData, setProfileData] = useState<{
+    features: {
+      avg_load: number;
+      peak_load: number;
+      volatility: number;
+      flow_index: number;
+      peak_count_per_session: number;
+    };
+    sessionCount: number;
+    loading: boolean;
+    error: string | null;
+  }>({
+    features: {
+      avg_load: 0,
+      peak_load: 0,
+      volatility: 0,
+      flow_index: 0,
+      peak_count_per_session: 0,
+    },
+    sessionCount: 0,
+    loading: true,
+    error: null,
+  });
+
   const [demoMode, setDemoMode] = useState(false);
   const [demoEstimates, setDemoEstimates] = useState<LoadEstimate[]>([]);
   const [fatigueIndex, setFatigueIndex] = useState(0);
@@ -149,6 +184,133 @@ export default function App() {
   const sessionStartRef = useRef<number | null>(null);
   const demoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const demoInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+  const loadProfile = async () => {
+    try {
+      setProfileData((prev) => ({
+        ...prev,
+        loading: true,
+        error: null,
+      }));
+
+      const userId = sessionId;
+
+      // First load the user's session history.
+      // This lets us show the "not enough sessions" state
+      // without requiring a fingerprint to already exist.
+      const sessionsResponse = await fetch(
+        `http://127.0.0.1:8000/api/sessions/user/${encodeURIComponent(userId)}`
+      );
+
+      if (!sessionsResponse.ok) {
+        throw new Error("Could not load session history");
+      }
+
+      const sessionsData = await sessionsResponse.json();
+      const sessions = sessionsData.sessions ?? [];
+
+      // Sprint 4 requirement: fewer than 3 sessions
+      // should show the placeholder state.
+      if (sessions.length < 3) {
+        setProfileData({
+          features: {
+            avg_load: 0,
+            peak_load: 0,
+            volatility: 0,
+            flow_index: 0,
+            peak_count_per_session: 0,
+          },
+          sessionCount: sessions.length,
+          loading: false,
+          error: null,
+        });
+        return;
+      }
+
+      // We have enough sessions, so now load the aggregate fingerprint.
+      const fingerprintResponse = await fetch(
+        `http://127.0.0.1:8000/api/analytics/users/${encodeURIComponent(userId)}/fingerprint`
+      );
+
+      if (!fingerprintResponse.ok) {
+        throw new Error("Could not load behavioural fingerprint");
+      }
+
+      const fingerprint = await fingerprintResponse.json();
+
+      // Load individual session summaries in batches of 5.
+      const summaries: any[] = [];
+
+      for (let i = 0; i < sessions.length; i += 5) {
+        const batch = sessions.slice(i, i + 5);
+
+        const results = await Promise.all(
+          batch.map(async (session: any) => {
+            try {
+              const response = await fetch(
+                `http://127.0.0.1:8000/api/analytics/sessions/${encodeURIComponent(
+                  session.session_id
+                )}/summary`
+              );
+
+              if (!response.ok) return null;
+
+              return await response.json();
+            } catch {
+              return null;
+            }
+          })
+        );
+
+        summaries.push(...results.filter(Boolean));
+      }
+
+      if (summaries.length === 0) {
+        throw new Error("No session summaries were available");
+      }
+
+      const average = (values: number[]) =>
+        values.length
+          ? values.reduce((sum, value) => sum + value, 0) / values.length
+          : 0;
+
+      setProfileData({
+        features: {
+          avg_load:
+            fingerprint.avg_load ??
+            average(summaries.map((s) => s.avg_load ?? 0)),
+          peak_load: average(
+            summaries.map((s) => s.peak_load ?? 0)
+          ),
+          volatility: average(
+            summaries.map((s) => s.volatility ?? 0)
+          ),
+          flow_index: average(
+            summaries.map((s) => s.flow_index ?? 0)
+          ),
+          peak_count_per_session: average(
+            summaries.map((s) => s.peak_count ?? 0)
+          ),
+        },
+        sessionCount: summaries.length,
+        loading: false,
+        error: null,
+      });
+    } catch (error) {
+      setProfileData((prev) => ({
+        ...prev,
+        loading: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to load behavioural profile",
+      }));
+    }
+  };
+
+  loadProfile();
+}, [sessionId]);
 
   useEffect(() => {
     if (isConnected) {
@@ -190,6 +352,23 @@ export default function App() {
   const estimates = isConnected ? liveEstimates : demoEstimates;
   const currentLoad = isConnected ? liveLoad
     : demoEstimates.length > 0 ? demoEstimates[demoEstimates.length - 1].load : null;
+    const inFlowEpisode =
+      estimates.length > 0 &&
+      estimates[estimates.length - 1].load < 0.35;
+
+    const recentLoadsForAnomaly = estimates.slice(-10).map(
+      estimate => estimate.load
+    );
+
+    const previousLoadForAnomaly =
+      recentLoadsForAnomaly.length >= 2
+        ? recentLoadsForAnomaly[recentLoadsForAnomaly.length - 2]
+        : 0;
+
+    const isAnomaly =
+      currentLoad !== null &&
+      currentLoad > 0.7 &&
+      previousLoadForAnomaly <= 0.7;
 
   useEffect(() => {
     if (currentLoad === null) return;
@@ -395,6 +574,13 @@ export default function App() {
       {/* ── Main ── */}
       <main style={{ maxWidth: 1280, margin: "0 auto", padding: "24px 24px 40px" }}>
 
+        <InterventionManager
+          load={currentLoad ?? 0}
+          fatigueIndex={fatigueIndex}
+          inFlowEpisode={inFlowEpisode}
+          isAnomaly={isAnomaly}
+        />
+
         <FatigueAlert
           fatigueIndex={fatigueIndex}
           history={fatigueHistory}
@@ -524,6 +710,12 @@ export default function App() {
 
             {/* Row 5: Live log */}
             <EstimateLog estimates={estimates} />
+
+            {/* Row 6: Signal correlations */}
+            {sessionId && (
+              <CorrelationMatrix sessionId={sessionId} />
+            )}
+
           </>
         )}
 
@@ -589,11 +781,217 @@ export default function App() {
                 }}
               />
             </GlowCard>
-          </div>
-        )}
+                    </div>
+                  )}
 
-        {/* ── About View ── */}
-        {view === "about" && (
+                  {/* ── Session Calendar View ── */}
+                  {view === "calendar" && (
+                    <div style={{ maxWidth: 1100 }}>
+                      <div style={{ marginBottom: 24 }}>
+                        <div
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            color: "#475569",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.12em",
+                            fontFamily: "'JetBrains Mono', monospace",
+                            marginBottom: 6,
+                          }}
+                        >
+                          Session History
+                        </div>
+
+                        <h2
+                          style={{
+                            margin: 0,
+                            fontSize: 22,
+                            fontWeight: 700,
+                            color: "#f8fafc",
+                          }}
+                        >
+                          Cognitive Load Calendar
+                        </h2>
+
+                        <p
+                          style={{
+                            margin: "8px 0 0",
+                            color: "#475569",
+                            fontSize: 13,
+                            maxWidth: 600,
+                          }}
+                        >
+                          Explore your cognitive load patterns across the last 52 weeks.
+                          Each day is coloured by average cognitive load.
+                        </p>
+                      </div>
+
+                      <SessionCalendar userId={sessionId} />
+                    </div>
+                  )}
+
+                  {/* ── Behavioural Profile View ── */}
+                  {view === "profile" && (
+                    <div style={{ maxWidth: 1100 }}>
+                      <div style={{ marginBottom: 24 }}>
+                        <div
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            color: "#6366f1",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.12em",
+                            fontFamily: "'JetBrains Mono', monospace",
+                            marginBottom: 6,
+                          }}
+                        >
+                          Behavioural Analysis
+                        </div>
+
+                        <h2
+                          style={{
+                            margin: 0,
+                            fontSize: 22,
+                            fontWeight: 700,
+                            color: "#f8fafc",
+                          }}
+                        >
+                          Behavioural Profile
+                        </h2>
+
+                        <p
+                          style={{
+                            margin: "8px 0 0",
+                            color: "#475569",
+                            fontSize: 13,
+                            maxWidth: 650,
+                          }}
+                        >
+                          Your cognitive work pattern is classified across four behavioural
+                          archetypes using load, flow, volatility, and overload patterns.
+                        </p>
+                      </div>
+
+                      {profileData.loading ? (
+                        <GlowCard style={{ padding: 40 }}>
+                          <div
+                            style={{
+                              display: "grid",
+                              gridTemplateColumns: "repeat(2, 1fr)",
+                              gap: 16,
+                            }}
+                          >
+                            {[1, 2, 3, 4].map((item) => (
+                              <div
+                                key={item}
+                                style={{
+                                  height: 390,
+                                  borderRadius: 14,
+                                  background: "rgba(255,255,255,0.03)",
+                                  border: "1px solid rgba(255,255,255,0.05)",
+                                }}
+                              />
+                            ))}
+                          </div>
+                        </GlowCard>
+                      ) : profileData.error ? (
+                        <GlowCard style={{ padding: 40 }}>
+                          <div
+                            style={{
+                              color: "#ef4444",
+                              fontSize: 13,
+                              fontFamily: "'JetBrains Mono', monospace",
+                            }}
+                          >
+                            {profileData.error}
+                          </div>
+                        </GlowCard>
+                      ) : profileData.sessionCount < 3 ? (
+                        <GlowCard
+                          style={{
+                            padding: "60px 40px",
+                            textAlign: "center",
+                          }}
+                        >
+                          <div
+                            style={{
+                              fontSize: 32,
+                              color: "#334155",
+                              marginBottom: 16,
+                            }}
+                          >
+                            ◎
+                          </div>
+
+                          <div
+                            style={{
+                              fontSize: 15,
+                              fontWeight: 600,
+                              color: "#64748b",
+                              marginBottom: 8,
+                            }}
+                          >
+                            Not enough session history
+                          </div>
+
+                          <div
+                            style={{
+                              fontSize: 12,
+                              color: "#334155",
+                              fontFamily: "'JetBrains Mono', monospace",
+                            }}
+                          >
+                            Complete at least 3 sessions to generate your behavioural profile.
+                          </div>
+
+                          <div
+                            style={{
+                              marginTop: 12,
+                              fontSize: 10,
+                              color: "#1e293b",
+                            }}
+                          >
+                            Sessions analysed: {profileData.sessionCount} / 3
+                          </div>
+                        </GlowCard>
+                      ) : (
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                            gap: 16,
+                          }}
+                        >
+                          {(() => {
+                            const classified = classifyArchetype(profileData.features);
+
+                            return ARCHETYPES.map((archetype) => {
+                              const isSelected = archetype.name === classified.name;
+
+                            return (
+                              <ArchetypeCard
+                                key={archetype.name}
+                                result={{
+                                  ...classified,
+                                  name: archetype.name,
+                                  centroid: archetype.centroid,
+                                  distance: isSelected ? classified.distance : 0,
+                                  confidence: isSelected ? classified.confidence : 0,
+                                  leastLike: classified.leastLike,
+                                }}
+                                dimmed={!isSelected}
+                                isSelected={isSelected}
+                              />
+                            );
+                          });
+                        })()}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* ── About View ── */}
+                  {view === "about" && (
           <div style={{ maxWidth: 760 }}>
             {/* Hero */}
             <div style={{
